@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>StepDeck · 管理端</title>
+<link rel="stylesheet" href="/style.css?v=3">
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">
+    <div class="mark"></div>
+    <div>
+      <div class="name">StepDeck</div>
+      <div class="sub">管理端 · 需密码 · <b>v3</b></div>
+    </div>
+  </div>
+  <div class="bar-acts">
+    <button class="icon-btn" id="btnLogs" title="运行日志">
+      <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h11"/></svg>
+    </button>
+    <button class="icon-btn" id="btnLogout" title="退出登录">
+      <svg viewBox="0 0 24 24"><path d="M15 12H3m4-4-4 4 4 4M11 4h7a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-7"/></svg>
+    </button>
+  </div>
+</header>
+
+<section class="stats" id="stats">
+  <div class="tile">
+    <div class="k">今日总步数</div>
+    <div class="v" id="sSteps">—</div>
+  </div>
+  <div class="tile">
+    <div class="k">托管中</div>
+    <div class="v" id="sCustody">—</div>
+  </div>
+  <div class="tile">
+    <div class="k">今日提交</div>
+    <div class="v" id="sSubmits">—</div>
+  </div>
+  <div class="tile">
+    <div class="k">下次执行</div>
+    <div class="v small" id="sNext">—</div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="section-head">
+    <h2>待审申请 <span class="count" id="reqCount">0</span></h2>
+    <button class="btn ghost sm" id="btnReqAll">只看待审</button>
+  </div>
+  <div id="reqs" class="reqs"></div>
+</section>
+
+<section class="section">
+  <div class="section-head">
+    <h2>账号 <span class="count" id="accCount">0</span></h2>
+    <button class="btn" id="btnAdd">+ 添加账号</button>
+  </div>
+  <div id="list" class="list"></div>
+</section>
+
+<div class="drawer" id="drawer">
+  <div class="drawer-head">
+    <h3>运行日志</h3>
+    <button class="btn ghost sm" id="btnPw" style="margin-left:auto;margin-right:8px">改密码</button>
+    <button class="icon-btn" id="drawerClose">
+      <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+  </div>
+  <div class="drawer-body" id="logs"></div>
+</div>
+<div class="scrim" id="scrim"></div>
+
+<!-- 添加账号 -->
+<div class="modal" id="mAdd">
+  <div class="sheet">
+    <h3>添加账号</h3>
+    <label>账号（手机号 / 邮箱）<input id="fUser" autocomplete="off" placeholder="you@example.com"></label>
+    <label>密码<input id="fPass" type="password" autocomplete="off" placeholder="••••••"></label>
+    <label>备注<input id="fNote" autocomplete="off" placeholder="例如：主号 / 小号（公开页会显示这个）" maxlength="20"></label>
+    <label>通道
+      <select id="fProv">
+        <option value="zepp_dry">Zepp · 演练（组包不发送）</option>
+        <option value="zepp">Zepp · 真实提交</option>
+        <option value="mock">模拟（离线）</option>
+      </select>
+    </label>
+    <p class="hint" id="probeMsg">可以先检测账号是否存在，不用密码</p>
+    <div class="row">
+      <button class="btn ghost" id="doProbe">检测账号</button>
+      <button class="btn" id="doAdd">添加</button>
+    </div>
+    <div class="row">
+      <button class="btn ghost" data-close="mAdd">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- 设置 -->
+<div class="modal" id="mCfg">
+  <div class="sheet">
+    <h3>自动执行设置</h3>
+    <label>目标步数<input id="cTarget" type="number" inputmode="numeric" placeholder="30000"></label>
+    <label>每天执行时间<input id="cExec" type="time" value="07:00"></label>
+    <label>增长方式
+      <select id="cMode">
+        <option value="normal">一次到位 — 到点直接提交目标值</option>
+        <option value="smart">渐进爬坡 — 按小时分摊，全天自然增长</option>
+      </select>
+    </label>
+    <div class="row">
+      <button class="btn ghost" data-close="mCfg">取消</button>
+      <button class="btn" id="doCfg">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 修改账号 -->
+<div class="modal" id="mEdit">
+  <div class="sheet">
+    <h3>修改账号</h3>
+    <label>账号<input id="eUser" autocomplete="off"></label>
+    <label>密码<input id="ePass" type="password" autocomplete="off" placeholder="留空 = 不改"></label>
+    <label>备注<input id="eNote" autocomplete="off" placeholder="例如：小号 / 公司号"></label>
+    <label>通道
+      <select id="eProv">
+        <option value="zepp_dry">Zepp · 演练</option>
+        <option value="zepp">Zepp · 真实提交</option>
+        <option value="mock">模拟（离线）</option>
+      </select>
+    </label>
+    <p class="hint">改账号或密码会重新登录换 token</p>
+    <div class="row">
+      <button class="btn ghost" data-close="mEdit">取消</button>
+      <button class="btn" id="doEdit">保存</button>
+    </div>
+  </div>
+</div>
+
+<div class="gate" id="gate">
+  <div class="gate-box">
+    <div class="mark big"></div>
+    <h2 id="gateTitle">管理员登录</h2>
+    <p class="hint" id="gateHint">输入密码进入管理端</p>
+    <input id="gatePass" type="password" autocomplete="current-password" placeholder="管理员密码">
+    <button class="btn" id="gateBtn">进入</button>
+    <p class="hint small"><a href="/">← 返回公开页</a></p>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/app.js?v=3"></script>
+</body>
+</html>

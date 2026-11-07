@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>StepDeck · 步数申请</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body class="public">
+
+<header class="bar">
+  <div class="brand">
+    <div class="mark"></div>
+    <div>
+      <div class="name">StepDeck</div>
+      <div class="sub">提交改步数申请 · 管理员审核后生效</div>
+    </div>
+  </div>
+</header>
+
+<section class="section first">
+  <div class="section-head">
+    <h2>选择账号 <span class="count" id="accCount">0</span></h2>
+  </div>
+  <div id="list" class="plist"></div>
+</section>
+
+<section class="section">
+  <div class="section-head"><h2>提交申请</h2></div>
+  <div class="pform">
+    <label>目标步数
+      <input id="pSteps" type="number" inputmode="numeric" min="1" max="98800" placeholder="例如 30000">
+    </label>
+    <label>你的称呼（可选）
+      <input id="pWho" autocomplete="off" placeholder="留空显示为匿名" maxlength="20">
+    </label>
+    <label>备注（可选）
+      <input id="pNote" autocomplete="off" placeholder="想说的话，管理员能看到" maxlength="80">
+    </label>
+    <p class="hint" id="pTip">先点上面选一个账号，再填步数提交</p>
+    <button class="btn wide" id="pSend">提交申请</button>
+  </div>
+</section>
+
+<section class="section">
+  <div class="section-head">
+    <h2>我的申请</h2>
+    <button class="btn ghost sm" id="pRefresh">刷新</button>
+  </div>
+  <div id="mine" class="reqs"></div>
+</section>
+
+<footer class="foot">
+  本站只接受改步数申请，账号管理在 <a href="/admin">管理端</a>
+</footer>
+
+<div class="toast" id="toast"></div>
+<script src="/public.js"></script>
+</body>
+</html>
