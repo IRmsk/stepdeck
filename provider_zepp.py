@@ -41,6 +41,12 @@ import uuid
 import time
 from datetime import datetime, timezone, timedelta
 
+try:
+    from Crypto.Cipher import AES as _AES_MOD  # noqa: F401
+    HAS_CRYPTO = True
+except Exception:
+    HAS_CRYPTO = False
+
 # Zepp 以北京时间为准；容器是 UTC，直接用 now() 会差一天（会把昨天的记录当成今天）
 CST = timezone(timedelta(hours=8))
 
@@ -327,7 +333,7 @@ class ZeppProvider:
         try:
             return self.login_plain(username, password)
         except ZeppError as e1:
-            if "429" in str(e1):
+            if "429" in str(e1) or not HAS_CRYPTO:
                 raise
             try:
                 return self.login(username, password)
