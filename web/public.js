@@ -59,7 +59,7 @@ function renderAccounts() {
         <div class="badge ${a.status === 'ok' ? 'ok' : 'wait'}">${n(a.current)} 步</div>
       </div>
       <div class="pmeta">${esc(a.account)}${a.note ? ' · ' + esc(a.note) : ''}</div>
-    </div>`).join('') : '<div class="empty">还没有可申请的账号</div>';
+    </div>`).join('') : '<div class="empty">管理员还没开放任何账号可申请</div>';
 }
 
 async function loadAccounts() {

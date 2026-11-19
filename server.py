@@ -13,33 +13,60 @@ KeepWeb · 网页版步数托管台（全免费，无卡密/无广告/无次数�
   * providers.mock   离线模拟，把整套产品先跑通（默认）
 """
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import os
-from datetime import timezone, timedelta
-
-CST = timezone(timedelta(hours=8))
-
-
-def today_str():
-    return datetime.now(CST).strftime("%Y-%m-%d")
 import re
+import secrets
 import sqlite3
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-try:
-    from provider_zepp import ZeppProvider, ZeppError
-except Exception:  # 单文件也能跑
-    ZeppProvider = None
+CST = timezone(timedelta(hours=8))
+
+
+def now_cst():
+    return datetime.now(CST)
+
+
+def now_str():
+    return now_cst().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def today_str():
+    return now_cst().strftime("%Y-%m-%d")
+
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE, "data", "keepweb.db")
+DATA_DIR = os.environ.get("STEPDECK_DATA") or os.path.join(BASE, "data")
+DB_PATH = os.path.join(DATA_DIR, "keepweb.db")
 WEB_DIR = os.path.join(BASE, "web")
 CONFIG_PATH = os.path.join(BASE, "config.json")
+SECRET_PATH = os.path.join(DATA_DIR, ".secret")
+INIT_PASSWORD_PATH = os.path.join(DATA_DIR, "INITIAL-PASSWORD.txt")
+
+# 缺依赖时不能静默跳过：要在界面上说清楚 Zepp 通道到底能不能用
+PROVIDER_IMPORT_ERROR = None
+try:
+    from provider_zepp import ZeppProvider, ZeppError, HTTP_DEPS_ERROR
+except Exception as _e:  # noqa: BLE001
+    ZeppProvider = None
+    ZeppError = Exception
+    HTTP_DEPS_ERROR = "requests 未安装"
+    PROVIDER_IMPORT_ERROR = "%s: %s" % (type(_e).__name__, _e)
+
+ZEPP_UNAVAILABLE = None
+if PROVIDER_IMPORT_ERROR:
+    ZEPP_UNAVAILABLE = "provider_zepp 导入失败（%s）" % PROVIDER_IMPORT_ERROR
+elif HTTP_DEPS_ERROR:
+    ZEPP_UNAVAILABLE = ("缺 requests 依赖（%s）：真实提交不可用，"
+                        "演练/组包仍然能用" % HTTP_DEPS_ERROR)
 
 # ---------------------------------------------------------------- 数据库
 
@@ -60,6 +87,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     mode        TEXT DEFAULT 'normal',    -- normal / smart
     custody     INTEGER DEFAULT 0,        -- 托管开关
     enabled     INTEGER DEFAULT 1,
+    share       INTEGER DEFAULT 0,        -- 1 = 允许在公开页申请
     last_run    TEXT,
     created_at  TEXT
 );
@@ -86,6 +114,11 @@ CREATE TABLE IF NOT EXISTS logs (
     level    TEXT,
     message  TEXT
 );
+CREATE TABLE IF NOT EXISTS sessions (
+    tok_hash   TEXT PRIMARY KEY,          -- 只存 sha256，库泄露也拿不到 cookie
+    expires_at REAL NOT NULL,
+    created_at TEXT
+);
 """
 
 
@@ -96,12 +129,13 @@ def db():
 
 
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
     c = db()
     c.executescript(SCHEMA)
     # 轻量迁移：老库补列
     cols = {r[1] for r in c.execute("PRAGMA table_info(accounts)")}
-    for name, typ in (("user_id", "TEXT"), ("password", "TEXT"), ("note", "TEXT")):
+    for name, typ in (("user_id", "TEXT"), ("password", "TEXT"), ("note", "TEXT"),
+                      ("share", "INTEGER DEFAULT 0")):
         if name not in cols:
             c.execute("ALTER TABLE accounts ADD COLUMN %s %s" % (name, typ))
     c.commit()
@@ -110,12 +144,13 @@ def init_db():
 
 # ---------------------------------------------------------------- 管理员口令
 
-import hashlib
-import secrets
-
-SESSIONS = {}          # token -> 过期时间戳
 SESSION_TTL = 7 * 24 * 3600
 COOKIE_NAME = "sd_admin"
+MIN_PASSWORD_LEN = 8
+LOGIN_MAX_FAILS = 5
+LOGIN_LOCK_SECONDS = 300
+LOGIN_FAILS = {}       # ip -> [连续失败次数, 解锁时间戳]
+LOGIN_LOCK = threading.Lock()
 
 
 def _setting(k, default=None):
@@ -133,7 +168,13 @@ def _set_setting(k, v):
 
 
 def _hash(pw, salt):
+    """老格式：sha256(salt|pw)，只用于校验历史库里的密码。"""
     return hashlib.sha256((salt + "|" + pw).encode("utf-8")).hexdigest()
+
+
+def _hash_pbkdf2(pw, salt, iterations=200_000):
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt.encode("utf-8"), iterations)
+    return "pbkdf2$%d$%s$%s" % (iterations, salt, dk.hex())
 
 
 def admin_ready():
@@ -141,30 +182,111 @@ def admin_ready():
 
 
 def admin_check(pw):
-    salt = _setting("admin_salt") or ""
-    return _hash(pw, salt) == (_setting("admin_hash") or "")
+    stored = _setting("admin_hash") or ""
+    if not stored or not pw:
+        return False
+    if stored.startswith("pbkdf2$"):
+        try:
+            _, it, salt, _digest = stored.split("$", 3)
+        except ValueError:
+            return False
+        return hmac.compare_digest(_hash_pbkdf2(pw, salt, int(it)), stored)
+    return hmac.compare_digest(_hash(pw, _setting("admin_salt") or ""), stored)
 
 
 def admin_set_password(pw):
-    salt = secrets.token_hex(8)
-    _set_setting("admin_salt", salt)
-    _set_setting("admin_hash", _hash(pw, salt))
+    salt = secrets.token_hex(16)
+    _set_setting("admin_hash", _hash_pbkdf2(pw, salt))
+    _set_setting("admin_salt", "")          # 升级后不再需要老盐
+    drop_all_sessions()
+
+
+def ensure_admin_password():
+    """没有密码时生成一次性随机密码写进 0600 文件；绝不接受「谁先访问谁设密码」。"""
+    if admin_ready():
+        return None
+    pw = os.environ.get("STEPDECK_ADMIN_PASSWORD") or secrets.token_urlsafe(9)
+    _set_setting("admin_hash", _hash_pbkdf2(pw, secrets.token_hex(16)))
+    _set_setting("admin_salt", "")
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        fd = os.open(INIT_PASSWORD_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(pw + "\n")
+    except Exception:
+        pass
+    return pw
+
+
+# ---------------- 会话（存库，重启不掉线；库里只有 sha256） ----------------
+
+def _tok_hash(tok):
+    return hashlib.sha256(tok.encode("utf-8")).hexdigest()
 
 
 def new_session():
     t = secrets.token_hex(24)
-    SESSIONS[t] = time.time() + SESSION_TTL
+    c = db()
+    c.execute("DELETE FROM sessions WHERE expires_at < ?", (time.time(),))
+    c.execute("INSERT INTO sessions(tok_hash, expires_at, created_at) VALUES(?,?,?)",
+              (_tok_hash(t), time.time() + SESSION_TTL, now_str()))
+    c.commit()
+    c.close()
     return t
 
 
 def session_ok(tok):
-    exp = SESSIONS.get(tok)
-    if not exp:
+    if not tok:
         return False
-    if exp < time.time():
-        SESSIONS.pop(tok, None)
-        return False
-    return True
+    c = db()
+    r = c.execute("SELECT expires_at FROM sessions WHERE tok_hash=?", (_tok_hash(tok),)).fetchone()
+    if r and r[0] > time.time():
+        c.close()
+        return True
+    if r:
+        c.execute("DELETE FROM sessions WHERE tok_hash=?", (_tok_hash(tok),))
+        c.commit()
+    c.close()
+    return False
+
+
+def drop_session(tok):
+    if not tok:
+        return
+    c = db()
+    c.execute("DELETE FROM sessions WHERE tok_hash=?", (_tok_hash(tok),))
+    c.commit()
+    c.close()
+
+
+def drop_all_sessions():
+    c = db()
+    c.execute("DELETE FROM sessions")
+    c.commit()
+    c.close()
+
+
+# ---------------- 登录限流 ----------------
+
+def login_locked(ip):
+    with LOGIN_LOCK:
+        fails, until = LOGIN_FAILS.get(ip, (0, 0))
+        if until and until > time.time():
+            return int(until - time.time()) + 1
+    return 0
+
+
+def login_fail(ip):
+    with LOGIN_LOCK:
+        fails, _until = LOGIN_FAILS.get(ip, (0, 0))
+        fails += 1
+        until = time.time() + LOGIN_LOCK_SECONDS if fails >= LOGIN_MAX_FAILS else 0
+        LOGIN_FAILS[ip] = (fails, until)
+
+
+def login_reset(ip):
+    with LOGIN_LOCK:
+        LOGIN_FAILS.pop(ip, None)
 
 
 def mask_user(u):
@@ -178,7 +300,7 @@ def mask_user(u):
 def log(acc_id, message, level="info"):
     c = db()
     c.execute("INSERT INTO logs(acc_id, ts, level, message) VALUES(?,?,?,?)",
-              (acc_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, message))
+              (acc_id, now_str(), level, message))
     c.commit()
     c.close()
 
@@ -287,7 +409,50 @@ if ZeppProvider:
 
 
 def get_provider(name):
-    return PROVIDERS.get(name, MockProvider)()
+    """未知 / 缺依赖的通道一律显式报错。
+
+    旧版本用 PROVIDERS.get(name, MockProvider) 兜底：没装 requests 时选「Zepp 真实提交」
+    会静默跑离线模拟，界面上还是绿的，用户以为改成功了。
+    """
+    name = (name or "mock").strip()
+    factory = PROVIDERS.get(name)
+    if factory is None:
+        usable = ", ".join(sorted(PROVIDERS))
+        if name.startswith("zepp") and PROVIDER_IMPORT_ERROR:
+            raise ProviderError("通道 %s 不可用：provider_zepp 导入失败（%s）。装好依赖后重启服务。"
+                                % (name, PROVIDER_IMPORT_ERROR))
+        raise ProviderError("未知通道 %s；本机可用：%s" % (name, usable))
+    return factory()
+
+
+def provider_catalog():
+    """给前端用的通道清单，带可用性和真实/模拟标识。"""
+    out = []
+    meta = {
+        "zepp": ("Zepp · 真实提交", "zepp", True),
+        "zepp_dry": ("Zepp · 演练（组包不发送）", "zepp", False),
+        "mock": ("离线模拟（不碰网络）", "mock", False),
+        "keep": ("Keep（需要自己填协议）", "keep", True),
+    }
+    for key in sorted(PROVIDERS):
+        label, family, real = meta.get(key, (key, key, True))
+        item = {"id": key, "label": label, "family": family,
+                "real": real, "available": True}
+        if family == "zepp":
+            reason = None
+            if PROVIDER_IMPORT_ERROR:
+                reason = "provider_zepp 导入失败（%s）" % PROVIDER_IMPORT_ERROR
+            elif key == "zepp" and HTTP_DEPS_ERROR:
+                # 演练模式只组包不发请求，缺 requests 也能用
+                reason = "缺 requests 依赖（%s）" % HTTP_DEPS_ERROR
+            if reason:
+                item.update(available=False, error=reason, label=label + "（不可用）")
+        out.append(item)
+    if "zepp" not in PROVIDERS:
+        out.append({"id": "zepp", "label": "Zepp · 真实提交（不可用）",
+                    "family": "zepp", "real": True, "available": False,
+                    "error": ZEPP_UNAVAILABLE or "provider_zepp 不可用"})
+    return out
 
 
 # ---------------------------------------------------------------- 业务
@@ -301,6 +466,7 @@ def row_to_dict(r):
     d.pop("token", None)
     d["custody"] = bool(d.get("custody"))
     d["enabled"] = bool(d.get("enabled"))
+    d["share"] = bool(d.get("share"))
     return d
 
 
@@ -320,7 +486,9 @@ def api_stats():
 
 
 def api_probe(body):
-    """不登录也能知道账号在不在（Zepp 对已注册号返回 400，不存在返回 401）"""
+    """不登录也能知道账号在不在"""
+    if ZeppProvider is None:
+        return {"ok": False, "message": "Zepp 通道不可用：%s" % PROVIDER_IMPORT_ERROR}
     username = (body.get("username") or "").strip()
     if not username:
         return {"ok": False, "message": "先填账号"}
@@ -338,27 +506,113 @@ def api_accounts():
     return rows
 
 
-import base64
+# ---------------- 账号密码静态加密 ----------------
+# 老版本是 base64（等于明文）。现在用本地随机密钥做「HMAC-SHA256 计数器流 + 独立 tag」，
+# 不引入第三方依赖；密钥在 data/.secret（0600），单独拿走数据库解不出密码。
+
+SECRET_LOCK = threading.Lock()
+_SECRET = None
 
 
-def _obf(pw):
-    return base64.b64encode((pw or "").encode()).decode() if pw else ""
+def _secret():
+    global _SECRET
+    if _SECRET:
+        return _SECRET
+    with SECRET_LOCK:
+        if _SECRET:
+            return _SECRET
+        os.makedirs(DATA_DIR, exist_ok=True)
+        if os.path.exists(SECRET_PATH):
+            try:
+                raw = open(SECRET_PATH, "rb").read().strip()
+                if len(raw) >= 32:
+                    _SECRET = raw[:32]
+                    return _SECRET
+            except OSError:
+                pass
+        key = secrets.token_bytes(32)
+        fd = os.open(SECRET_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(key)
+        os.chmod(SECRET_PATH, 0o600)
+        _SECRET = key
+        return _SECRET
 
 
-def _deobf(v):
-    try:
-        return base64.b64decode((v or "").encode()).decode()
+def _keystream(key, nonce, n):
+    out = b""
+    i = 0
+    while len(out) < n:
+        out += hmac.new(key, nonce + i.to_bytes(8, "big"), hashlib.sha256).digest()
+        i += 1
+    return out[:n]
+
+
+def seal(plain):
+    if not plain:
+        return ""
+    raw = plain.encode("utf-8")
+    key = _secret()
+    nonce = secrets.token_bytes(16)
+    ct = bytes(a ^ b for a, b in zip(raw, _keystream(key, nonce, len(raw))))
+    tag = hmac.new(key, b"tag" + nonce + ct, hashlib.sha256).digest()
+    return "v1:" + base64.b64encode(nonce + ct + tag).decode()
+
+
+def unseal(stored):
+    v = stored or ""
+    if not v:
+        return ""
+    if v.startswith("v1:"):
+        try:
+            blob = base64.b64decode(v[3:])
+            nonce, ct, tag = blob[:16], blob[16:-32], blob[-32:]
+            key = _secret()
+            if not hmac.compare_digest(tag, hmac.new(key, b"tag" + nonce + ct,
+                                                     hashlib.sha256).digest()):
+                return ""
+            return bytes(a ^ b for a, b in zip(ct, _keystream(key, nonce, len(ct)))).decode("utf-8")
+        except Exception:
+            return ""
+    try:                                   # 老库的 base64，读出来由 migrate_secrets 升级
+        return base64.b64decode(v.encode()).decode()
     except Exception:
         return ""
 
 
+def migrate_secrets():
+    c = db()
+    rows = c.execute("SELECT id, password FROM accounts "
+                     "WHERE password IS NOT NULL AND password != ''").fetchall()
+    n = 0
+    for r in rows:
+        if str(r[1]).startswith("v1:"):
+            continue
+        plain = unseal(r[1])
+        if plain:
+            c.execute("UPDATE accounts SET password=? WHERE id=?", (seal(plain), r[0]))
+            n += 1
+    c.commit()
+    c.close()
+    if n:
+        log(None, "已把 %d 条账号密码升级为加密存储" % n)
+
+
 def api_add_account(body):
-    provider = body.get("provider") or "mock"
-    prov = get_provider(provider)
+    provider = (body.get("provider") or "mock").strip()
+    try:
+        prov = get_provider(provider)          # 先证明通道真的可用，再拿密码
+    except ProviderError as e:
+        return {"ok": False, "message": str(e)}
     username = body.get("username", "").strip()
+    password = body.get("password", "") or ""
+    if not username:
+        return {"ok": False, "message": "先填账号"}
+    if not password:
+        return {"ok": False, "message": "先填密码"}
     # 限流/网络问题不要吞掉账号：先存下来，标成待登录，之后提交时自动重登
     try:
-        info = getattr(prov, "login_any", prov.login)(username, body.get("password", ""))
+        info = getattr(prov, "login_any", prov.login)(username, password)
     except Exception as e:
         msg = str(e)
         if "429" in msg or "timeout" in msg.lower() or "timed out" in msg.lower():
@@ -366,8 +620,8 @@ def api_add_account(body):
             c = db()
             c.execute("""INSERT INTO accounts(id, username, password, provider, nickname, token, user_id,
                          status, created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
-                      (acc_id, username, _obf(body.get("password")), provider, username, "", "",
-                       "pending", datetime.now().isoformat(timespec="seconds")))
+                      (acc_id, username, seal(password), provider, username, "", "",
+                       "pending", now_str()))
             if (body.get("note") or "").strip():
                 c.execute("UPDATE accounts SET note=? WHERE id=?",
                           (body["note"].strip()[:40], acc_id))
@@ -377,31 +631,31 @@ def api_add_account(body):
                 % ("限流" if "429" in msg else "网络超时"), "error")
             return {"ok": True, "id": acc_id, "pending": True,
                     "message": "账号已保存；当前登录被限流，稍后提交会自动重试"}
-        raise
+        return {"ok": False, "message": "登录失败：%s" % msg}
     acc_id = uuid.uuid4().hex[:12]
     c = db()
     c.execute("""INSERT INTO accounts(id, username, password, provider, nickname, token, user_id, status, created_at)
                  VALUES(?,?,?,?,?,?,?,?,?)""",
-              (acc_id, body.get("username", "").strip(), _obf(body.get("password")),
+              (acc_id, username, seal(password),
                provider, info.get("nickname"), info.get("token"),
                str(info.get("user_id") or ""), info.get("status", "ok"),
-               datetime.now().isoformat(timespec="seconds")))
+               now_str()))
     if (body.get("note") or "").strip():
         c.execute("UPDATE accounts SET note=? WHERE id=?",
                   (body["note"].strip()[:40], acc_id))
     c.commit()
     c.close()
     log(acc_id, "账号添加成功（%s）" % provider)
-    return {"ok": True, "id": acc_id}
+    return {"ok": True, "id": acc_id, "provider": provider}
 
 
 def api_update_account(acc_id, body):
     fields, values = [], []
-    for k in ("target", "exec_at", "mode", "custody", "enabled", "note"):
+    for k in ("target", "exec_at", "mode", "custody", "enabled", "note", "share"):
         if k in body:
             fields.append("%s=?" % k)
             v = body[k]
-            if k in ("custody", "enabled"):
+            if k in ("custody", "enabled", "share"):
                 values.append(int(bool(v)))
             elif k == "target":
                 values.append(int(v or 0))
@@ -429,7 +683,7 @@ def api_edit_account(acc_id, body):
     username = (body.get("username") or acc["username"]).strip()
     provider = body.get("provider") or acc["provider"]
     new_pw = body.get("password")
-    password = new_pw if new_pw else _deobf(acc.get("password"))
+    password = new_pw if new_pw else unseal(acc.get("password"))
 
     info = {}
     relogin = bool(new_pw) or username != acc["username"] or provider != acc["provider"]
@@ -444,7 +698,7 @@ def api_edit_account(acc_id, body):
 
     c = db()
     sets = ["username=?", "provider=?", "password=?"]
-    vals = [username, provider, _obf(password)]
+    vals = [username, provider, seal(password)]
     if relogin:
         sets += ["token=?", "user_id=?", "nickname=?", "status=?"]
         vals += [info.get("token"), str(info.get("user_id") or ""),
@@ -457,6 +711,8 @@ def api_edit_account(acc_id, body):
         sets.append("mode=?"); vals.append(body["mode"])
     if "note" in body:
         sets.append("note=?"); vals.append((body.get("note") or "").strip()[:40])
+    if "share" in body:
+        sets.append("share=?"); vals.append(int(bool(body["share"])))
     vals.append(acc_id)
     c.execute("UPDATE accounts SET %s WHERE id=?" % ",".join(sets), vals)
     c.commit()
@@ -484,7 +740,7 @@ def do_submit(acc_id, steps=None):
     # 之前没登录成功（限流/网络）的账号：提交时先补一次登录，成功就继续
     if not acc.get("token") and acc.get("password"):
         try:
-            info = getattr(prov, "login_any", prov.login)(acc["username"], _deobf(acc["password"]))
+            info = getattr(prov, "login_any", prov.login)(acc["username"], unseal(acc["password"]))
             c = db()
             c.execute("UPDATE accounts SET token=?, user_id=?, status='ok' WHERE id=?",
                       (info.get("token"), str(info.get("user_id") or ""), acc_id))
@@ -500,9 +756,14 @@ def do_submit(acc_id, steps=None):
     if not acc.get("token"):
         return {"ok": False, "pending": True,
                 "message": "账号还没登录成功。点卡片上的『修改』填对密码。"}
-    target = steps or acc["target"] or 0
+    try:
+        target = int(steps if steps not in (None, "", 0) else (acc["target"] or 0))
+    except (TypeError, ValueError):
+        return {"ok": False, "message": "步数要是数字"}
     if target <= 0:
         return {"ok": False, "message": "还没填步数：在卡片输入框里输入数值，或点『设置』填目标"}
+    if target > 98800:
+        return {"ok": False, "message": "单日上限 98,800，%d 会被服务端截断" % target}
 
     prov = get_provider(acc["provider"])
     try:
@@ -522,10 +783,10 @@ def do_submit(acc_id, steps=None):
     if changed:
         c.execute("""UPDATE accounts SET current=?, submit_cnt=submit_cnt+1, status='ok',
                      last_run=? WHERE id=?""",
-                  (got, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), acc_id))
+                  (got, now_str(), acc_id))
     else:
         c.execute("UPDATE accounts SET submit_cnt=submit_cnt+1, status='warn', last_run=? WHERE id=?",
-                  (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), acc_id))
+                  (now_str(), acc_id))
     c.commit()
     c.close()
     log(acc_id, "提交 %d 步: %s" % (target, res.get("message", "ok")),
@@ -537,9 +798,11 @@ def do_submit(acc_id, steps=None):
 # ---------------------------------------------------------------- 申请单
 
 def public_accounts():
+    """只有管理员显式打开「公开可申请」的账号才会出现在公开页。"""
     c = db()
     rows = [dict(r) for r in c.execute(
-        "SELECT id, username, note, current, target, status FROM accounts ORDER BY created_at")]
+        "SELECT id, username, note, current, target, status, share FROM accounts "
+        "WHERE share=1 AND enabled=1 ORDER BY created_at")]
     c.close()
     out = []
     for r in rows:
@@ -568,6 +831,9 @@ def api_request_create(body):
     if not acc:
         c.close()
         return {"ok": False, "message": "账号不存在"}
+    if not acc["share"] or not acc["enabled"]:
+        c.close()
+        return {"ok": False, "message": "这个账号没有开放申请"}
     # 同一账号 + 同一目标值，重复待审的申请直接合并，不刷屏
     dup = c.execute("SELECT id FROM requests WHERE account_id=? AND steps=? AND status='pending'",
                     (acc_id, steps)).fetchone()
@@ -635,19 +901,26 @@ def api_request_handle(req_id, approve, reason=""):
     return {"ok": True, "status": status, "result": res}
 
 
+def _last_run_dt(last):
+    try:
+        return datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CST)
+    except Exception:
+        return None
+
+
 def scheduler_loop():
-    """托管：到点自动提交，一天只跑一次（智能模式按小时分摊）"""
+    """托管：到点自动提交。全部按 UTC+8 判断，避免容器是 UTC 时整体错 8 小时。"""
     while True:
         try:
             c = db()
             rows = c.execute("SELECT * FROM accounts WHERE custody=1 AND enabled=1").fetchall()
             c.close()
-            now = datetime.now()
+            now = now_cst()
             for r in rows:
                 acc = dict(r)
-                if acc["target"] <= 0:
+                if (acc.get("target") or 0) <= 0:
                     continue
-                exec_at = acc["exec_at"] or now.strftime("%H:%M")
+                exec_at = acc.get("exec_at") or now.strftime("%H:%M")
                 try:
                     hh, mm = [int(x) for x in exec_at.split(":")[:2]]
                 except Exception:
@@ -655,15 +928,19 @@ def scheduler_loop():
                 due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
                 if now < due:
                     continue
-                last = acc["last_run"] or ""
-                if last.startswith(now.strftime("%Y-%m-%d")):
-                    continue
-                if acc["mode"] == "smart":
-                    # 智能模式：按小时把目标拆成多段，本次提交当前应到量
+                last = _last_run_dt(acc.get("last_run") or "")
+                if acc.get("mode") == "smart":
+                    # 渐进爬坡：当天没到目标就每 30 分钟补一次，按小时算「现在应该到多少」
+                    if (acc.get("current") or 0) >= acc["target"]:
+                        continue
+                    if last and last.date() == now.date() and (now - last).total_seconds() < 1800:
+                        continue
                     hours = max(1, now.hour - 6)
                     part = int(acc["target"] * min(1.0, hours / 18.0))
                     do_submit(acc["id"], max(1, part))
                 else:
+                    if last and last.date() == now.date():
+                        continue
                     do_submit(acc["id"])
         except Exception as e:
             log(None, "调度异常: %s" % e, "error")
@@ -688,12 +965,19 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     # --- 工具
+    def _sec(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+
     def _json(self, obj, code=200):
         data = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self._sec()
         self.end_headers()
         self.wfile.write(data)
 
@@ -707,8 +991,19 @@ class Handler(BaseHTTPRequestHandler):
         return ""
 
     def _admin(self):
-        tok = self._cookie(COOKIE_NAME) or self.headers.get("X-Admin-Token") or ""
-        return session_ok(tok)
+        return session_ok(self._cookie(COOKIE_NAME))
+
+    def _same_origin(self):
+        """挡跨站 POST：浏览器会带 Origin/Sec-Fetch-Site，非同类请求直接拒。"""
+        origin = self.headers.get("Origin") or ""
+        site = self.headers.get("Sec-Fetch-Site") or ""
+        if not origin and not site:
+            return True
+        if site and site not in ("same-origin", "none"):
+            return False
+        if origin:
+            return urlparse(origin).netloc == (self.headers.get("Host") or "")
+        return True
 
     def _deny(self):
         return self._json({"ok": False, "needAdmin": True, "message": "需要管理员密码"}, 401)
@@ -717,6 +1012,12 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         if not n:
             return {}
+        if n > 1024 * 1024:
+            raise ValueError("请求体太大")
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            # 只收 JSON：跨站表单发不出这个 Content-Type，等于顺手挡掉 CSRF
+            raise ValueError("Content-Type 必须是 application/json")
         try:
             return json.loads(self.rfile.read(n).decode())
         except Exception:
@@ -727,8 +1028,13 @@ class Handler(BaseHTTPRequestHandler):
             path = "/index.html"
         if path.rstrip("/") in ("/admin", "/console", "/manage"):
             path = "/admin.html"
-        fp = os.path.normpath(os.path.join(WEB_DIR, path.lstrip("/")))
-        if not fp.startswith(WEB_DIR) or not os.path.isfile(fp):
+        root = os.path.realpath(WEB_DIR)
+        try:
+            fp = os.path.realpath(os.path.join(root, path.lstrip("/")))
+            inside = os.path.commonpath([fp, root]) == root
+        except (OSError, ValueError):
+            inside = False
+        if not inside or not os.path.isfile(fp):
             self.send_error(404)
             return
         ext = os.path.splitext(fp)[1]
@@ -737,6 +1043,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", MIME.get(ext, "application/octet-stream"))
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self._sec()
+        if ext == ".html":
+            self.send_header("Content-Security-Policy",
+                             "default-src 'self'; img-src 'self' data:; "
+                             "style-src 'self' 'unsafe-inline'; script-src 'self'")
         self.end_headers()
         self.wfile.write(data)
 
@@ -749,10 +1060,14 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/public/accounts":
                 return self._json({"ok": True, "accounts": public_accounts()})
             if p == "/api/public/requests":
-                who = (q.get("who") or [""])[0] or None
+                # 以前不带 who 会返回所有人的申请（含备注），等于公开别人的单子
+                who = ((q.get("who") or [""])[0] or "").strip()[:40]
+                if not who:
+                    return self._json({"ok": True, "requests": []})
                 return self._json({"ok": True, "requests": api_request_list(who=who, limit=30)})
             if p == "/api/admin/me":
-                return self._json({"ok": True, "admin": self._admin(), "ready": admin_ready()})
+                return self._json({"ok": True, "admin": self._admin(), "ready": admin_ready(),
+                                   "initHint": os.path.basename(INIT_PASSWORD_PATH)})
 
             # 管理端
             if p.startswith("/api/"):
@@ -773,42 +1088,53 @@ class Handler(BaseHTTPRequestHandler):
                 c.close()
                 return self._json({"ok": True, "logs": rows})
             if p == "/api/meta":
-                return self._json({"ok": True, "providers": list(PROVIDERS),
-                                   "admin_ready": admin_ready()})
+                return self._json({"ok": True, "providers": provider_catalog(),
+                                   "provider_import_error": ZEPP_UNAVAILABLE,
+                                   "admin_ready": admin_ready(),
+                                   "limits": {"maxSteps": 98800, "minAdminPassword": MIN_PASSWORD_LEN}})
             return self._static(p)
         except Exception as e:
             return self._json({"ok": False, "message": str(e)}, 500)
 
     def do_POST(self):
         p = urlparse(self.path).path
-        body = self._body()
+        if not self._same_origin():
+            return self._json({"ok": False, "message": "跨站请求被拒绝"}, 403)
+        try:
+            body = self._body()
+        except ValueError as e:
+            return self._json({"ok": False, "message": str(e)}, 415)
         try:
             # ---- 公开：提交申请 ----
             if p == "/api/public/requests":
                 return self._json(api_request_create(body))
             if p == "/api/admin/login":
+                ip = self.client_address[0]
+                left = login_locked(ip)
+                if left:
+                    return self._json({"ok": False, "message": "密码错误次数太多，%d 秒后再试" % left}, 429)
                 if not admin_ready():
-                    pw = (body.get("password") or "").strip()
-                    if len(pw) < 4:
-                        return self._json({"ok": False, "message": "密码至少 4 位"})
-                    admin_set_password(pw)
-                elif not admin_check((body.get("password") or "").strip()):
+                    return self._json({"ok": False,
+                                       "message": "服务端还没生成管理员密码，看 %s" % INIT_PASSWORD_PATH}, 503)
+                if not admin_check((body.get("password") or "").strip()):
+                    login_fail(ip)
                     return self._json({"ok": False, "message": "密码不对"}, 401)
+                login_reset(ip)
                 tok = new_session()
-                data = json.dumps({"ok": True, "message": "已登录"}).encode()
+                data = json.dumps({"ok": True, "message": "已登录"}, ensure_ascii=False).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Set-Cookie",
                                  "%s=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Lax"
                                  % (COOKIE_NAME, tok, SESSION_TTL))
+                self._sec()
                 self.end_headers()
                 self.wfile.write(data)
                 return
 
             if p == "/api/admin/logout":
-                tok = self._cookie(COOKIE_NAME)
-                SESSIONS.pop(tok, None)
+                drop_session(self._cookie(COOKIE_NAME))
                 data = json.dumps({"ok": True}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -825,10 +1151,14 @@ class Handler(BaseHTTPRequestHandler):
                 new = (body.get("new") or "").strip()
                 if not admin_check(old):
                     return self._json({"ok": False, "message": "原密码不对"}, 401)
-                if len(new) < 4:
-                    return self._json({"ok": False, "message": "新密码至少 4 位"})
-                admin_set_password(new)
-                SESSIONS.clear()
+                if len(new) < MIN_PASSWORD_LEN:
+                    return self._json({"ok": False,
+                                       "message": "新密码至少 %d 位" % MIN_PASSWORD_LEN})
+                admin_set_password(new)      # 内部会清掉所有会话
+                try:
+                    os.remove(INIT_PASSWORD_PATH)
+                except OSError:
+                    pass
                 return self._json({"ok": True, "message": "密码已更新，请重新登录"})
 
             # ---- 管理端 ----
@@ -865,6 +1195,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         p = urlparse(self.path).path
+        if not self._same_origin():
+            return self._json({"ok": False, "message": "跨站请求被拒绝"}, 403)
         if not self._admin():
             return self._deny()
         m = re.fullmatch(r"/api/accounts/([0-9a-f]+)", p)
@@ -882,10 +1214,12 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", default="8088", help="端口，可写多个：8088,8099")
-    ap.add_argument("--host", default="0.0.0.0", help="监听地址，默认 0.0.0.0（同网段可访问）")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="监听地址。默认只开本机；要让同网段访问用 0.0.0.0（先设好管理员密码）")
     a = ap.parse_args()
     init_db()
-    threading.Thread(target=scheduler_loop, daemon=True).start()
+    migrate_secrets()
+    first_pw = ensure_admin_password()
 
     ports = [int(x) for x in str(a.port).replace(" ", "").split(",") if x.strip()]
     servers = []
@@ -901,6 +1235,19 @@ def main():
 
     if not servers:
         raise SystemExit("所有端口都被占用")
+
+    print("数据目录：%s" % DATA_DIR, flush=True)
+    if first_pw:
+        print("首次启动已生成管理员密码：%s" % first_pw, flush=True)
+        print("  同一份也写在 %s（0600），登录后请立刻改密码" % INIT_PASSWORD_PATH, flush=True)
+    if a.host not in ("127.0.0.1", "localhost", "::1"):
+        print("警告：当前监听在 %s，同网段任何人都能打开管理端。"
+              "确认已设强密码，或改用 --host 127.0.0.1 + 反向代理" % a.host, flush=True)
+    if ZEPP_UNAVAILABLE:
+        print("警告：Zepp 通道不可用（%s）。装上依赖后重启；"
+              "在补好之前管理端只会显示 mock / 演练通道。" % ZEPP_UNAVAILABLE, flush=True)
+
+    threading.Thread(target=scheduler_loop, daemon=True).start()
     while True:
         time.sleep(3600)
 

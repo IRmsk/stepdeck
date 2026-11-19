@@ -56,7 +56,26 @@ def today_str():
 import uuid as uuidlib
 from datetime import datetime
 
-import requests
+def _http():
+    """惰性导入：没装 requests 时，演练模式（只组包不发送）依然能用。"""
+    try:
+        import requests
+    except ImportError as e:
+        raise ZeppError("缺 requests 依赖（pip install requests）：%s" % e)
+    return requests
+
+
+def http_deps_ok():
+    """有 requests 才能真正发请求；给上层做「通道是否可用」的判断。"""
+    try:
+        import requests  # noqa: F401
+        return True, None
+    except Exception as e:  # noqa: BLE001
+        return False, "%s: %s" % (type(e).__name__, e)
+
+
+HTTP_DEPS_OK, HTTP_DEPS_ERROR = http_deps_ok()
+
 
 # ---- 常量（来自 APK） ----
 # 实测：真正能吃下账号密码的是这组（/v2/client/login 是第三方 OAuth 客户端用的，不是账号登录）
@@ -191,11 +210,14 @@ class ZeppProvider:
                             "明文登录不受影响，pip install pycryptodome 可启用备份链路")
         return AES.new(AES_KEY, AES.MODE_CBC, iv=AES_IV).encrypt(pad(data, 16))
 
-    CACHE_DIR = "/tmp/zepp_tokens"
+    # 旧版本把 token 写进 /tmp（同机任何用户可读），现在放 data/ 下并限 0600
+    CACHE_DIR = os.path.join(
+        os.environ.get("STEPDECK_DATA") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data"), "zepp_tokens")
 
     def _cache_path(self, username):
         import os
-        os.makedirs(self.CACHE_DIR, exist_ok=True)
+        os.makedirs(self.CACHE_DIR, mode=0o700, exist_ok=True)
         safe = "".join(c if c.isalnum() else "_" for c in username)
         return os.path.join(self.CACHE_DIR, safe + ".json")
 
@@ -222,16 +244,18 @@ class ZeppProvider:
         try:
             r = self.login_plain(username, password)
         except Exception as e1:
-            if "429" in str(e1):
+            if "429" in str(e1) or not HAS_CRYPTO:
                 raise
             try:
                 r = self.login(username, password)
             except Exception:
                 raise e1
         try:
-            json.dump({"token": r["token"], "user_id": r["user_id"],
-                       "login_token": self.login_token, "ts": time.time()},
-                      open(self._cache_path(username), "w"))
+            fp = self._cache_path(username)
+            fd = os.open(fp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump({"token": r["token"], "user_id": r["user_id"],
+                           "login_token": self.login_token, "ts": time.time()}, f)
         except Exception:
             pass
         return r
@@ -251,6 +275,7 @@ class ZeppProvider:
           3) account*-cn.huami.com /v1/client/app_tokens        → app_token
         每步都在多台主机间轮换，命中 429 就换下一台，全部命中才报限流。
         """
+        _http()                     # 缺 requests 直接抛 ZeppError，别伪装成网络问题
         import urllib.parse as up
         acc = ("+86" + username) if (username.isdigit() and len(username) == 11) else username
         third = "huami_phone" if acc.startswith("+86") else "huami"
@@ -263,7 +288,7 @@ class ZeppProvider:
         code, last_err, rate_limited, rejected = None, None, 0, 0
         for host in LOGIN_HOSTS:
             try:
-                r = requests.post("%s/registrations/%s/tokens" % (host, quoted),
+                r = _http().post("%s/registrations/%s/tokens" % (host, quoted),
                                   data=form, headers=self.PLAIN_H, timeout=20)
             except Exception as e:
                 last_err = "%s 连不上（%s）" % (host, type(e).__name__)
@@ -295,7 +320,7 @@ class ZeppProvider:
         ti = None
         for host in CLIENT_HOSTS:
             try:
-                r2 = requests.post(host + "/v2/client/login", data=d2, headers=self.PLAIN_H, timeout=20)
+                r2 = _http().post(host + "/v2/client/login", data=d2, headers=self.PLAIN_H, timeout=20)
                 if r2.status_code == 200:
                     ti = (r2.json() or {}).get("token_info") or {}
                     if ti.get("login_token"):
@@ -308,7 +333,7 @@ class ZeppProvider:
         app_token = None
         for host in TOKEN_HOSTS:
             try:
-                r3 = requests.get(
+                r3 = _http().get(
                     host + "/v1/client/app_tokens?app_name=com.xiaomi.hm.health"
                     "&dn=api-user.huami.com%2Capi-mifit.huami.com%2Capp-analytics.huami.com"
                     "&login_token=" + ti["login_token"] + "&os_version=4.1.0",
@@ -344,11 +369,13 @@ class ZeppProvider:
 
     def login(self, username, password):
         url, headers, body = self.build_login(username, password)
+        if not self.dry_run:
+            _http()
         if self.dry_run:
             return {"token": "dry-" + uuidlib.uuid4().hex[:10], "nickname": username,
                     "status": "ok", "dry_run": True, "request": {"url": url, "bytes": len(body)}}
 
-        r = requests.post(url, data=body, headers=headers, allow_redirects=False, timeout=25)
+        r = _http().post(url, data=body, headers=headers, allow_redirects=False, timeout=25)
         loc = r.headers.get("Location", "")
         if r.status_code == 429:
             raise ZeppError("429 登录太频繁，被限流了，等几分钟再试")
@@ -384,7 +411,7 @@ class ZeppProvider:
             "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
             "accept": "application/json, text/plain, */*", "accept-language": "zh-CN,zh;q=0.9",
         }
-        r2 = requests.post(LOGIN_HOST + "/v2/client/login", data=lp, headers=lh, timeout=25)
+        r2 = _http().post(LOGIN_HOST + "/v2/client/login", data=lp, headers=lh, timeout=25)
         if r2.status_code != 200:
             raise ZeppError("换取 app_token 失败（HTTP %s）: %s" % (r2.status_code, r2.text[:200]))
         info = (r2.json() or {}).get("token_info") or {}
@@ -398,15 +425,50 @@ class ZeppProvider:
 
     # ---------------- 探测账号是否存在 ----------------
     def probe(self, username):
-        url, headers, body = self.build_login(username, "x")
-        r = requests.post(url, data=body, headers=headers, allow_redirects=False, timeout=20)
-        loc = r.headers.get("Location", "")
-        q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(loc).query))
-        return {"exists": r.status_code == 303 and "access=" in loc,
-                "raw": q.get("error") or str(r.status_code)}
+        """用明文 token 端点探测账号是否存在（只发错误密码，不碰真实密码）。
+
+        服务端对「已注册 + 密码错」和「未注册」返回的错误码历史上变过，
+        所以这里不做绝对断言：能确定才给 True/False，拿不准返回 None。
+        """
+        import urllib.parse as up
+        acc = ("+86" + username) if (username.isdigit() and len(username) == 11) else username
+        quoted = up.quote(acc)
+        form = ("client_id=HuaMi&country_code=CN&json_response=true&name=%s&password=%s"
+                "&redirect_uri=https://s3-us-west-2.amazonaws.com/hm-registration/successsignin.html"
+                "&state=REDIRECTION&token=access" % (quoted, up.quote("probe-not-a-real-password")))
+        raws = []
+        for host in LOGIN_HOSTS:
+            try:
+                r = _http().post("%s/registrations/%s/tokens" % (host, quoted),
+                                 data=form, headers=self.PLAIN_H, timeout=15)
+            except ZeppError:
+                raise
+            except Exception:
+                continue
+            try:
+                j = r.json() or {}
+            except Exception:
+                j = {}
+            raws.append("%s:%s/%s" % (host.split("//")[-1], r.status_code,
+                                      j.get("error", "")))
+            err = j.get("error")
+            if err in (401, "401"):
+                return {"exists": False, "raw": ",".join(raws),
+                        "note": "服务端说没有这个账号（启发式）"}
+            if err in (400, "400"):
+                return {"exists": True, "raw": ",".join(raws),
+                        "note": "服务端认这个账号（密码错所以 400）"}
+            if r.status_code == 200:
+                return {"exists": True, "raw": ",".join(raws),
+                        "note": "端点有响应，账号大概率存在"}
+            if r.status_code == 429:
+                raise ZeppError("探测被限流了（429），过几分钟再试")
+        return {"exists": None, "raw": ",".join(raws[:2]) or "所有主机都没响应",
+                "note": "探测结果不确定；泽普的错误码会变，直接添加账号更可靠"}
 
     # ---------------- 读云端每日数据 ----------------
     def read_day(self, token, user_id, date=None):
+        _http()
         d = date or today_str()
         H = self._headers(token, user_id); H.pop("Content-Type", None)
         r, err = None, None
@@ -414,7 +476,7 @@ class ZeppProvider:
             u = ("%s/v1/data/band_data.json?query_type=summary&device_type=0"
                  "&from_date=%s&to_date=%s" % (host, d, d))
             try:
-                r = requests.get(u, headers=H, timeout=20)
+                r = _http().get(u, headers=H, timeout=20)
             except Exception as e:
                 err = "%s 连不上（%s）" % (host, type(e).__name__)
                 continue
@@ -429,8 +491,15 @@ class ZeppProvider:
         row = next((x for x in data if x.get("date_time") == d), None)
         if not row:
             return None
-        import base64 as _b64
-        summary = json.loads(_b64.b64decode(row["summary"]))
+        raw_summary = row["summary"]
+        if isinstance(raw_summary, dict):
+            summary = raw_summary
+        else:
+            try:
+                summary = json.loads(raw_summary)
+            except Exception:
+                import base64 as _b64
+                summary = json.loads(_b64.b64decode(raw_summary))
         return {"row": row, "summary": summary,
                 "steps": ((summary.get("stp") or {}).get("ttl") or 0)}
 
@@ -464,7 +533,7 @@ class ZeppProvider:
         """先问服务端这个账号真正绑定的设备，写数据时用同一个 did，App 才会认"""
         for host in ("https://api-mifit-cn.huami.com", "https://api-mifit.huami.com"):
             try:
-                r = requests.get("%s/users/%s/devices?enable=true" % (host, uid),
+                r = _http().get("%s/users/%s/devices?enable=true" % (host, uid),
                                  headers={"apptoken": token}, timeout=12)
                 if r.status_code != 200:
                     continue
@@ -481,6 +550,8 @@ class ZeppProvider:
                     if it.get("deviceId") and it.get("bindingStatus") in (1, True):
                         return it["deviceId"]
                 return items[0]["deviceId"]
+            except ZeppError:
+                raise
             except Exception:
                 continue
         return self.DEVICE_ID
@@ -511,6 +582,8 @@ class ZeppProvider:
         发送后一律回读校验，不拿 200 当成功。
         """
         token, uid = account.get("token"), account.get("user_id")
+        if not self.dry_run:
+            _http()
         if self.dry_run:
             return {"ok": True, "submitted": 0, "dry_run": True,
                     "message": "演练模式：包已组装，未发送"}
@@ -544,7 +617,7 @@ class ZeppProvider:
         for host in DATA_HOSTS:
             u = "%s/v1/data/band_data.json?&t=%d" % (host, int(time.time() * 1000))
             try:
-                r = requests.post(u, data=form, headers=headers, timeout=25)
+                r = _http().post(u, data=form, headers=headers, timeout=25)
             except Exception as e:
                 last = "%s 连不上（%s）" % (host, type(e).__name__)
                 continue
