@@ -133,6 +133,7 @@ function card(a) {
       <button class="btn sm ghost" data-act="config">设置</button>
       <button class="btn sm ghost" data-act="note">备注</button>
       <button class="btn sm ghost" data-act="share">${a.share ? '取消公开' : '公开'}</button>
+      <button class="btn sm ghost" data-act="devcheck">查设备</button>
       <button class="btn sm ghost" data-act="edit">修改</button>
       <button class="btn sm danger" data-act="delete">删除</button>
     </div>
@@ -302,6 +303,14 @@ document.addEventListener('click', async e => {
       });
       toast(r.ok ? (!a.share ? '已开放到公开页' : '已从公开页撤下') : (r.message || '操作失败'), 2400);
       refresh(); break;
+    }
+
+    case 'devcheck': {
+      el.disabled = true;
+      const r = await api(`/api/accounts/${a.id}/check`);
+      el.disabled = false;
+      toast(r.ok ? r.verdict : (r.message || '查不到'), r.ok ? 5200 : 3600);
+      break;
     }
 
     case 'config':

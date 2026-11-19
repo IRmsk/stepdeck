@@ -112,6 +112,31 @@ LOGIN_HOST = "https://api-mifit-cn.huami.com"
 DATA_HOST = "https://api-mifit-cn.huami.com"
 
 
+def device_verdict(items):
+    """根据绑定设备列表判断「刷步能不能带动微信/支付宝」。
+
+    Zepp Life 的原话：未绑定手表/手环设备，步数将无法同步到微信运动。
+    返回 (level, message)，level 取 ok / warn / bad。
+    """
+    if not items:
+        return "bad", "没有任何绑定设备 —— Zepp 不会把步数同步到微信/支付宝，刷了只改 Zepp 里的数"
+    fresh = None
+    for it in items:
+        try:
+            age = (time.time() - int(it.get("lastDataSyncTime"))) / 86400.0
+        except Exception:
+            continue
+        if fresh is None or age < fresh:
+            fresh = age
+    if fresh is None:
+        return "warn", "有设备记录但读不到最后同步时间，微信链路状态未知"
+    if fresh <= 2:
+        return "ok", "有设备且 %.1f 天内有同步 —— 微信/支付宝链路应该是通的" % fresh
+    if fresh <= 14:
+        return "warn", "有设备但已 %.0f 天没同步 —— 设备离线，微信可能停在旧值" % fresh
+    return "warn", "设备已 %.0f 天没同步 —— 绑定关系可能已经失效" % fresh
+
+
 class ZeppError(Exception):
     pass
 
@@ -704,8 +729,12 @@ class ZeppProvider:
             blk["tz"] = 28800
         return item
 
-    def active_device_id(self, token, uid):
-        """优先查 binds.json 拿 deviceType==0 的设备（去冒号转大写），再回退老端点。"""
+    def list_devices(self, token, uid):
+        """列出账号绑定/激活过的设备（binds.json 优先，回退 /users/{uid}/devices）。
+
+        微信/支付宝能不能跟随刷步，取决于这里有没有「已绑定 + 近期同步」的设备。
+        """
+        out = []
         for host in ("https://api-mifit-cn.huami.com", "https://api-mifit.zepp.com"):
             try:
                 r = _http().get("%s/v1/device/binds.json?userid=%s" % (host, uid),
@@ -724,34 +753,47 @@ class ZeppProvider:
                 items = (r.json() or {}).get("items") or []
             except Exception:
                 continue
-            for it in items:
-                if it.get("deviceType") in (0, "0"):
-                    did = str(it.get("deviceId") or it.get("mac") or "")
-                    did = did.replace(":", "").upper()
-                    if did:
-                        return did
+            out.extend(items)
+            if out:
+                return out
+
         for host in ("https://api-mifit-cn.huami.com", "https://api-mifit.huami.com"):
             try:
                 r = _http().get("%s/users/%s/devices?enable=true" % (host, uid),
                                 headers={"apptoken": token}, timeout=12)
-                if r.status_code != 200:
-                    continue
-                items = (r.json() or {}).get("items") or []
-                if not items:
-                    continue
-                for it in items:
-                    if not it.get("deviceId"):
-                        continue
-                    if it.get("activeStatus") in (1, True):
-                        return it["deviceId"]
-                for it in items:
-                    if it.get("deviceId") and it.get("bindingStatus") in (1, True):
-                        return it["deviceId"]
-                return items[0]["deviceId"]
             except ZeppError:
                 raise
             except Exception:
                 continue
+            if r.status_code == 429:
+                raise ZeppRateLimited("查设备列表被限流",
+                                      retry_after=_retry_after(getattr(r, "headers", {}), {})
+                                      or RATE_LIMIT_DEFAULT)
+            if r.status_code != 200:
+                continue
+            try:
+                out = (r.json() or {}).get("items") or []
+            except Exception:
+                out = []
+            return out
+        return out
+
+    def active_device_id(self, token, uid):
+        """上报用的 did：优先 deviceType==0 的设备（去冒号转大写），查不到用模板值。"""
+        try:
+            items = self.list_devices(token, uid)
+        except ZeppError:
+            raise
+        except Exception:
+            items = []
+        for it in items:
+            if it.get("deviceType") in (0, "0"):
+                did = str(it.get("deviceId") or it.get("mac") or "").replace(":", "").upper()
+                if did:
+                    return did
+        for it in items:
+            if it.get("deviceId"):
+                return it["deviceId"]
         return self.DEVICE_ID
 
     def build_upload(self, account, steps, date=None, template=None, device_id=None):
