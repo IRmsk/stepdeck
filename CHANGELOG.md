@@ -1,5 +1,43 @@
 # 更新记录
 
+## v0.3.0 — 协议层：token 复用、限流冷却、设备号一致性（2026-11）
+
+参考 mimotion / huami-token / xueji-x / FTech6 的实现核对后补的协议层改动（见 README 第十三节）。
+
+### 少登录 = 少 429
+
+- 新增 `ensure_session()`：提交前按 **app_token 探活 → login_token 换 app_token → login_token 续期
+  → 密码登录** 的顺序复用，探活通过就完全不登录。
+- token / login_token / device_id 落库（`accounts.token` / `login_token` / `device_id`），
+  提交成功后回写 provider 刷新过的值；401 时只换 token，不再走整条密码登录。
+- 新增 `check_alive()`（`huami.health.getUserInfo.json`）、`app_token_from_login_token()`、
+  `renew_login_token()`；探活接口不可用时按「换不了就重登」兜底。
+
+### 限流当状态机
+
+- 新增 `ZeppRateLimited` 异常（带 `retry_after`）与 `_retry_after()` 判定：
+  - HTTP 429；
+  - HTTP 200 + `{"code":12,"message":"too many requests"}`（以前会被当成功）；
+  - 优先读 `Retry-After` 头，没有就 429 / 业务限流按 2 小时。
+- 冷却写进 `accounts.cooldown_until`，**冷却期内 `do_submit` 直接返回，连登录都不发**；
+  卡片显示「冷却 N 分」。登录、读云端、查设备、上传四处都会触发冷却。
+
+### 设备号一致性
+
+- 每个账号生成一次 `uuid4`（保留连字符）持久化，登录和 `x-request-id`/`device_id` 共用；
+  去掉两条登录分支里不一致的写法（`uuid4().hex[:16]` 与写死的 `00:00:00:00:00:00`）。
+- 绑定设备优先查 `/v1/device/binds.json`（取 `deviceType==0`，去冒号转大写），
+  查不到再回退老端点；不再默认套模板里的 `DA932FFFFE8816E7`。
+- 上报 URL 补 `&r={uuid4}`。
+
+### 其它
+
+- 登录响应解析容错（缺 `token_info` 时给具体错误，不写死索引）。
+- `provider_zepp` 拆出 `grant_access_token` / `login_with_access` / `app_token_from_login_token` /
+  `renew_login_token`，便于以后端点变更时只改一处。
+- 测试从 27 条涨到 31 条：限流冷却落库、冷却期内不发请求、`Retry-After`/`code 12` 解析、
+  device_id 持久化且改账号不换设备号。
+
 ## v0.2.0 — 安全与正确性修复（2026-11）
 
 ### 修复（会让「看起来成功」变成真成功，或反过来）

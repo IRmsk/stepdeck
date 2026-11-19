@@ -54,10 +54,11 @@ INIT_PASSWORD_PATH = os.path.join(DATA_DIR, "INITIAL-PASSWORD.txt")
 # 缺依赖时不能静默跳过：要在界面上说清楚 Zepp 通道到底能不能用
 PROVIDER_IMPORT_ERROR = None
 try:
-    from provider_zepp import ZeppProvider, ZeppError, HTTP_DEPS_ERROR
+    from provider_zepp import ZeppProvider, ZeppError, ZeppRateLimited, HTTP_DEPS_ERROR
 except Exception as _e:  # noqa: BLE001
     ZeppProvider = None
     ZeppError = Exception
+    ZeppRateLimited = None
     HTTP_DEPS_ERROR = "requests 未安装"
     PROVIDER_IMPORT_ERROR = "%s: %s" % (type(_e).__name__, _e)
 
@@ -88,6 +89,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     custody     INTEGER DEFAULT 0,        -- 托管开关
     enabled     INTEGER DEFAULT 1,
     share       INTEGER DEFAULT 0,        -- 1 = 允许在公开页申请
+    device_id   TEXT,                     -- 每账号一个持久化 uuid4，登录/上报共用
+    login_token TEXT,                     -- 续 token 用，避免每次重新登录
+    cooldown_until REAL DEFAULT 0,        -- 限流冷却截止（epoch 秒）
     last_run    TEXT,
     created_at  TEXT
 );
@@ -135,7 +139,8 @@ def init_db():
     # 轻量迁移：老库补列
     cols = {r[1] for r in c.execute("PRAGMA table_info(accounts)")}
     for name, typ in (("user_id", "TEXT"), ("password", "TEXT"), ("note", "TEXT"),
-                      ("share", "INTEGER DEFAULT 0")):
+                      ("share", "INTEGER DEFAULT 0"), ("device_id", "TEXT"),
+                      ("login_token", "TEXT"), ("cooldown_until", "REAL DEFAULT 0")):
         if name not in cols:
             c.execute("ALTER TABLE accounts ADD COLUMN %s %s" % (name, typ))
     c.commit()
@@ -467,6 +472,11 @@ def row_to_dict(r):
     d["custody"] = bool(d.get("custody"))
     d["enabled"] = bool(d.get("enabled"))
     d["share"] = bool(d.get("share"))
+    left = int(max(0, (d.get("cooldown_until") or 0) - time.time()))
+    d["cooldown_left"] = left
+    d["hasLoginToken"] = bool(d.get("login_token"))
+    d.pop("login_token", None)
+    d.pop("cooldown_until", None)
     return d
 
 
@@ -606,6 +616,11 @@ def api_add_account(body):
         return {"ok": False, "message": str(e)}
     username = body.get("username", "").strip()
     password = body.get("password", "") or ""
+    device_id = (body.get("device_id") or "").strip() or str(uuid.uuid4())
+    try:
+        prov.device_id = device_id          # 一个账号一个设备号，登录与上报共用
+    except Exception:
+        pass
     if not username:
         return {"ok": False, "message": "先填账号"}
     if not password:
@@ -619,9 +634,9 @@ def api_add_account(body):
             acc_id = uuid.uuid4().hex[:12]
             c = db()
             c.execute("""INSERT INTO accounts(id, username, password, provider, nickname, token, user_id,
-                         status, created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                         status, device_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
                       (acc_id, username, seal(password), provider, username, "", "",
-                       "pending", now_str()))
+                       "pending", device_id, now_str()))
             if (body.get("note") or "").strip():
                 c.execute("UPDATE accounts SET note=? WHERE id=?",
                           (body["note"].strip()[:40], acc_id))
@@ -634,12 +649,13 @@ def api_add_account(body):
         return {"ok": False, "message": "登录失败：%s" % msg}
     acc_id = uuid.uuid4().hex[:12]
     c = db()
-    c.execute("""INSERT INTO accounts(id, username, password, provider, nickname, token, user_id, status, created_at)
-                 VALUES(?,?,?,?,?,?,?,?,?)""",
+    c.execute("""INSERT INTO accounts(id, username, password, provider, nickname, token, user_id,
+                 status, device_id, login_token, created_at)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
               (acc_id, username, seal(password),
                provider, info.get("nickname"), info.get("token"),
                str(info.get("user_id") or ""), info.get("status", "ok"),
-               now_str()))
+               device_id, getattr(prov, "login_token", "") or "", now_str()))
     if (body.get("note") or "").strip():
         c.execute("UPDATE accounts SET note=? WHERE id=?",
                   (body["note"].strip()[:40], acc_id))
@@ -686,12 +702,17 @@ def api_edit_account(acc_id, body):
     password = new_pw if new_pw else unseal(acc.get("password"))
 
     info = {}
+    device_id = acc.get("device_id") or str(uuid.uuid4())
     relogin = bool(new_pw) or username != acc["username"] or provider != acc["provider"]
     if relogin:
         if not password:
             return {"ok": False, "message": "改账号需要重新输入密码"}
         try:
             _p = get_provider(provider)
+            try:
+                _p.device_id = device_id
+            except Exception:
+                pass
             info = getattr(_p, "login_any", _p.login)(username, password)
         except Exception as e:
             return {"ok": False, "message": "登录失败：%s" % e}
@@ -699,10 +720,14 @@ def api_edit_account(acc_id, body):
     c = db()
     sets = ["username=?", "provider=?", "password=?"]
     vals = [username, provider, seal(password)]
+    sets += ["device_id=?"]
+    vals.append(device_id)
     if relogin:
-        sets += ["token=?", "user_id=?", "nickname=?", "status=?"]
+        sets += ["token=?", "user_id=?", "nickname=?", "status=?", "login_token=?",
+                 "cooldown_until=?"]
         vals += [info.get("token"), str(info.get("user_id") or ""),
-                 info.get("nickname") or username, info.get("status", "ok")]
+                 info.get("nickname") or username, info.get("status", "ok"),
+                 info.get("login_token") or "", 0]
     if "target" in body:
         sets.append("target=?"); vals.append(int(body["target"] or 0))
     if "exec_at" in body:
@@ -729,6 +754,17 @@ def api_delete_account(acc_id):
     return {"ok": True}
 
 
+def _set_cooldown(acc_id, seconds, reason=""):
+    until = time.time() + max(60, int(seconds))
+    c = db()
+    c.execute("UPDATE accounts SET cooldown_until=?, status='limited' WHERE id=?", (until, acc_id))
+    c.commit()
+    c.close()
+    log(acc_id, "进入限流冷却 %d 分钟%s" % (int(seconds // 60), ("：" + reason) if reason else ""),
+        "error")
+    return until
+
+
 def do_submit(acc_id, steps=None):
     c = db()
     r = c.execute("SELECT * FROM accounts WHERE id=?", (acc_id,)).fetchone()
@@ -736,18 +772,44 @@ def do_submit(acc_id, steps=None):
     if not r:
         return {"ok": False, "message": "账号不存在"}
     acc = dict(r)
-    prov = get_provider(acc["provider"])
+
+    # 冷却期内连登录都不发：账号维度被限流时换主机是无效的
+    left = int(max(0, (acc.get("cooldown_until") or 0) - time.time()))
+    if left:
+        return {"ok": False, "cooldown": left,
+                "message": "限流冷却中，还剩 %d 分钟。冷却期内不会重试（换主机也没用）。"
+                           % ((left + 59) // 60)}
+
+    try:
+        prov = get_provider(acc["provider"])
+    except ProviderError as e:
+        return {"ok": False, "message": str(e)}
+    try:
+        prov.device_id = acc.get("device_id") or prov.device_id
+    except Exception:
+        pass
+
     # 之前没登录成功（限流/网络）的账号：提交时先补一次登录，成功就继续
     if not acc.get("token") and acc.get("password"):
         try:
-            info = getattr(prov, "login_any", prov.login)(acc["username"], unseal(acc["password"]))
+            account_for_login = dict(acc)
+            account_for_login["password"] = unseal(acc["password"])
+            info = getattr(prov, "login_any", prov.login)(acc["username"],
+                                                          account_for_login["password"])
             c = db()
-            c.execute("UPDATE accounts SET token=?, user_id=?, status='ok' WHERE id=?",
-                      (info.get("token"), str(info.get("user_id") or ""), acc_id))
+            c.execute("UPDATE accounts SET token=?, user_id=?, login_token=?, status='ok' WHERE id=?",
+                      (info.get("token"), str(info.get("user_id") or ""),
+                       info.get("login_token") or "", acc_id))
             c.commit(); c.close()
             acc["token"] = info.get("token")
             acc["user_id"] = str(info.get("user_id") or "")
+            acc["login_token"] = info.get("login_token") or ""
             log(acc_id, "补登录成功，继续提交")
+        except ZeppRateLimited as e:
+            _set_cooldown(acc_id, e.retry_after, str(e)[:80])
+            return {"ok": False, "cooldown": e.retry_after,
+                    "message": "被限流：%s。已冷却 %d 分钟，冷却期内不再重试。"
+                               % (e, int(e.retry_after // 60))}
         except Exception as e:
             c = db(); c.execute("UPDATE accounts SET status='pending' WHERE id=?", (acc_id,))
             c.commit(); c.close()
@@ -765,9 +827,15 @@ def do_submit(acc_id, steps=None):
     if target > 98800:
         return {"ok": False, "message": "单日上限 98,800，%d 会被服务端截断" % target}
 
-    prov = get_provider(acc["provider"])
+    # provider 内部只认明文密码（用于 token 彻底失效时兜底）
+    acc["password"] = unseal(acc.get("password"))
     try:
         res = prov.submit(acc, target)
+    except ZeppRateLimited as e:
+        until = _set_cooldown(acc_id, e.retry_after, str(e)[:80])
+        return {"ok": False, "cooldown": int(until - time.time()),
+                "message": "被限流：%s。已冷却 %d 分钟，冷却期内不再重试。"
+                           % (e, int(e.retry_after // 60))}
     except Exception as e:
         log(acc_id, "提交失败: %s" % e, "error")
         c = db()
@@ -775,6 +843,20 @@ def do_submit(acc_id, steps=None):
         c.commit()
         c.close()
         return {"ok": False, "message": str(e)}
+
+    # 回写 provider 刷新过的 token / login_token / device_id，下次就不用再登录
+    sess = res.get("session") or {}
+    if sess.get("token"):
+        c = db()
+        c.execute("UPDATE accounts SET token=?, user_id=?, login_token=?, device_id=?, "
+                  "cooldown_until=0 WHERE id=?",
+                  (sess["token"], str(sess.get("user_id") or acc.get("user_id") or ""),
+                   sess.get("login_token") or "", sess.get("device_id") or acc.get("device_id") or "",
+                   acc_id))
+        c.commit()
+        c.close()
+        if sess.get("source") in ("login_token", "renew"):
+            log(acc_id, "复用缓存的 login_token 换到新 app_token（没有重新登录）")
 
     # 以真实回读为准：provider 返回 changed=False 时不能假装成功
     got = res.get("submitted", target)
@@ -791,8 +873,11 @@ def do_submit(acc_id, steps=None):
     c.close()
     log(acc_id, "提交 %d 步: %s" % (target, res.get("message", "ok")),
         "info" if changed else "error")
-    return {"ok": changed, "submitted": got, "changed": changed,
-            "message": res.get("message", "ok")}
+    out = {"ok": changed, "submitted": got, "changed": changed,
+           "message": res.get("message", "ok")}
+    if sess.get("source") in ("login_token", "renew", "app_token"):
+        out["session_reused"] = sess["source"]
+    return out
 
 
 # ---------------------------------------------------------------- 申请单

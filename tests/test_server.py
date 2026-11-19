@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -310,6 +311,79 @@ class TestHttpHardening(Base):
         st, data, _ = self.call("POST", "/api/accounts/%s/submit" % aid,
                                 {"steps": "很多"}, cookie=cookie)
         self.assertFalse(data["ok"])
+
+
+class FakeLimitedProvider:
+    """只用来验证「限流 → 持久化冷却 → 冷却期内不再发请求」。"""
+    name = "fake_limit"
+    device_id = "dev"
+    calls = 0
+
+    def login(self, username, password):
+        return {"token": "tok-fake", "user_id": "42", "status": "ok"}
+
+    def submit(self, account, steps):
+        FakeLimitedProvider.calls += 1
+        raise server.ZeppRateLimited("429 测试限流", retry_after=600)
+
+
+class TestRateLimitCooldown(Base):
+    def setUp(self):
+        FakeLimitedProvider.calls = 0
+        server.PROVIDERS["fake_limit"] = lambda: FakeLimitedProvider()
+        c = server.db()
+        c.execute("INSERT OR REPLACE INTO accounts(id, username, provider, token, user_id, "
+                  "status, target, device_id, created_at, password) "
+                  "VALUES('cool01','c@example.com','fake_limit','tok','42','ok',30000,'dev-1',?,?)",
+                  (server.now_str(), server.seal("pw")))
+        c.commit()
+        c.close()
+
+    def tearDown(self):
+        server.PROVIDERS.pop("fake_limit", None)
+        c = server.db()
+        c.execute("DELETE FROM accounts WHERE id='cool01'")
+        c.commit()
+        c.close()
+
+    def test_limited_sets_persistent_cooldown(self):
+        res = server.do_submit("cool01", 30000)
+        self.assertFalse(res["ok"])
+        self.assertIn("冷却", res["message"])
+        c = server.db()
+        until, status = c.execute(
+            "SELECT cooldown_until, status FROM accounts WHERE id='cool01'").fetchone()
+        c.close()
+        self.assertGreater(until, time.time() + 300)
+        self.assertEqual(status, "limited")
+
+    def test_no_request_during_cooldown(self):
+        server.do_submit("cool01", 30000)
+        first = FakeLimitedProvider.calls
+        res = server.do_submit("cool01", 30000)
+        self.assertEqual(FakeLimitedProvider.calls, first, "冷却期内不应该再发请求")
+        self.assertFalse(res["ok"])
+        self.assertGreater(res["cooldown"], 0)
+
+    def test_retry_after_parsing(self):
+        from provider_zepp import _retry_after
+        self.assertEqual(_retry_after({"Retry-After": "120"}, {}), 120)
+        self.assertEqual(_retry_after({}, {"code": 12, "message": "too many requests"}), 7200)
+        self.assertEqual(_retry_after({}, {"message": "success"}), None)
+
+    def test_device_id_persisted_and_stable(self):
+        cookie = self.login()
+        aid = self.add_mock_account(cookie, "devid@example.com")
+        c = server.db()
+        dev = c.execute("SELECT device_id FROM accounts WHERE id=?", (aid,)).fetchone()[0]
+        c.close()
+        self.assertTrue(dev and len(dev) >= 32, dev)
+        self.call("POST", "/api/accounts/%s/edit" % aid,
+                  {"username": "devid@example.com", "note": "改个备注"}, cookie=cookie)
+        c = server.db()
+        dev2 = c.execute("SELECT device_id FROM accounts WHERE id=?", (aid,)).fetchone()[0]
+        c.close()
+        self.assertEqual(dev, dev2, "改账号不该换 device_id")
 
 
 class TestSchedulerHelpers(Base):

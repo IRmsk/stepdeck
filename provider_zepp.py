@@ -96,6 +96,11 @@ LOGIN_HOSTS = ["https://api-user.huami.com", "https://api-user.zepp.com",
 CLIENT_HOSTS = ["https://account.huami.com", "https://account.zepp.com",
                 "https://account-cn.huami.com"]
 TOKEN_HOSTS = ["https://account-cn.huami.com", "https://account.huami.com"]
+# 探活 / 续期主机（探活能省掉整条登录链路）
+ALIVE_HOSTS = ["https://api-mifit-cn3.zepp.com", "https://api-mifit-cn.huami.com",
+               "https://api-mifit.zepp.com"]
+RENEW_HOSTS = ["https://account-cn3.zepp.com", "https://account-cn.zepp.com",
+               "https://account.zepp.com"]
 # 数据主机池
 DATA_HOSTS = ["https://api-mifit-cn.huami.com", "https://api-mifit.huami.com",
               "https://api-mifit.zepp.com", "https://api-mifit-cn.zepp.com"]
@@ -111,9 +116,41 @@ class ZeppError(Exception):
     pass
 
 
+class ZeppRateLimited(ZeppError):
+    """被限流：带建议冷却秒数，上层要据此做持久化冷却，冷却期内连登录都别发。"""
+
+    def __init__(self, message, retry_after=7200):
+        super().__init__(message)
+        self.retry_after = max(60, int(retry_after))
+
+
+RATE_LIMIT_DEFAULT = 7200        # 429 / code 12：两小时
+RATE_LIMIT_FAIL_DEFAULT = 1800   # 其它失败：半小时
+
+
+def _retry_after(headers, payload, default=RATE_LIMIT_DEFAULT):
+    """从 Retry-After 或业务错误码里判断这次是不是限流，返回建议冷却秒数。
+
+    2025-09 之后除了 HTTP 429，还有 HTTP 200 + {"code":12,"message":"too many requests"}，
+    只判 status_code 会把它当成功。
+    """
+    try:
+        ra = str((headers or {}).get("Retry-After") or "").strip()
+    except Exception:
+        ra = ""
+    if ra.isdigit():
+        return max(60, int(ra))
+    p = payload if isinstance(payload, dict) else {}
+    code = p.get("code")
+    msg = str(p.get("message") or "").lower()
+    if code in (12, "12") or "too many request" in msg or "频繁" in msg or "rate limit" in msg:
+        return default
+    return None
+
+
 def _device_id():
-    """Zepp 用 16 位十六进制设备号"""
-    return uuidlib.uuid4().hex[:16]
+    """登录用的设备号：一个账号一个，由上层持久化后复用（不要去连字符、不要每次重新生成）。"""
+    return str(uuidlib.uuid4())
 
 
 def _now_hms():
@@ -132,7 +169,7 @@ class ZeppProvider:
     name = "zepp"
 
     def __init__(self, region="cn", app_name="com.huami.midong",
-                 app_version="9.1.100", enc="plain", dry_run=True):
+                 app_version="9.1.100", enc="plain", dry_run=True, device_id=None):
         self.region = region
         self.app_name = app_name
         self.app_version = app_version
@@ -140,7 +177,7 @@ class ZeppProvider:
         self.dry_run = dry_run
         self.account_host = ACCOUNT_HOST_CN if region == "cn" else ACCOUNT_HOST_INTL
         self.data_host = DATA_HOST_CN if region == "cn" else DATA_HOST_INTL
-        self.device_id = _device_id()
+        self.device_id = device_id or _device_id()
 
     # ---------------- 公共头 ----------------
     def _headers(self, token=None, user_id=None):
@@ -267,91 +304,225 @@ class ZeppProvider:
         "app_name": "com.xiaomi.hm.health",
     }
 
-    def login_plain(self, username, password):
-        """
-        明文三步登录（参考 zepp-life-update-steps / Zepp-Steps-Automation）：
-          1) api-user*.huami.com  /registrations/{acct}/tokens  json_response=true → access
-          2) account*.huami.com   /v2/client/login              → login_token / user_id
-          3) account*-cn.huami.com /v1/client/app_tokens        → app_token
-        每步都在多台主机间轮换，命中 429 就换下一台，全部命中才报限流。
-        """
+    def login_plain(self, username, password, device_id=None):
+        """明文登录三步（被重点限流的那条路；日常应该走 ensure_session 复用 token）。"""
         _http()                     # 缺 requests 直接抛 ZeppError，别伪装成网络问题
+        self.device_id = device_id or self.device_id
+        access = self.grant_access_token(username, password)
+        bundle = self.login_with_access(access, username)
+        bundle["device_id"] = self.device_id
+        return bundle
+
+    # ---- 第 1 步：账号密码 → access ----
+    def grant_access_token(self, username, password):
         import urllib.parse as up
         acc = ("+86" + username) if (username.isdigit() and len(username) == 11) else username
-        third = "huami_phone" if acc.startswith("+86") else "huami"
         quoted = up.quote(acc)
-
         form = ("client_id=HuaMi&country_code=CN&json_response=true&name=%s&password=%s"
                 "&redirect_uri=https://s3-us-west-2.amazonaws.com/hm-registration/successsignin.html"
                 "&state=REDIRECTION&token=access" % (quoted, up.quote(password)))
-
-        code, last_err, rate_limited, rejected = None, None, 0, 0
+        last_err, rejected = None, 0
+        limited = {}
         for host in LOGIN_HOSTS:
             try:
                 r = _http().post("%s/registrations/%s/tokens" % (host, quoted),
-                                  data=form, headers=self.PLAIN_H, timeout=20)
+                                 data=form, headers=self.PLAIN_H, timeout=20)
+            except ZeppError:
+                raise
             except Exception as e:
                 last_err = "%s 连不上（%s）" % (host, type(e).__name__)
                 continue
-            if r.status_code == 429:
-                rate_limited += 1
+            try:
+                payload = r.json() or {}
+            except Exception:
+                payload = {}
+            cool = _retry_after(getattr(r, "headers", {}), payload)
+            if r.status_code == 429 or cool:
+                limited[host] = cool or RATE_LIMIT_DEFAULT
                 last_err = "%s 限流" % host
                 continue
             if r.status_code == 200:
-                j = r.json() or {}
-                code = j.get("access")
-                if code:
-                    break
-                if j.get("error") in (401, "401"):
+                if payload.get("access"):
+                    return payload["access"]
+                if payload.get("error") in (401, "401"):
                     rejected += 1        # 服务端明确说账号或密码不对
-                last_err = "%s 没给 access（error=%s）" % (host, j.get("error"))
+                last_err = "%s 没给 access（error=%s）" % (host, payload.get("error"))
             else:
                 last_err = "%s HTTP %s" % (host, r.status_code)
-        if not code:
-            if rate_limited >= len(LOGIN_HOSTS):
-                raise ZeppError("429 登录太频繁，多台主机都被限流了，等几分钟")
-            if rejected:
-                raise ZeppError("账号或密码不对（服务端返回 401）")
-            raise ZeppError("登录失败：%s" % (last_err or "未知原因"))
+        if limited and len(limited) >= len(LOGIN_HOSTS):
+            raise ZeppRateLimited("429 登录太频繁（%d 台主机全部限流）" % len(limited),
+                                  retry_after=max(limited.values()))
+        if limited:
+            raise ZeppRateLimited("登录被限流（%d/%d 台主机）" % (len(limited), len(LOGIN_HOSTS)),
+                                  retry_after=max(limited.values()))
+        if rejected:
+            raise ZeppError("账号或密码不对（服务端返回 401）")
+        raise ZeppError("登录失败：%s" % (last_err or "未知原因"))
 
-        d2 = ("app_name=com.xiaomi.hm.health&country_code=CN&code=%s&device_id=00:00:00:00:00:00"
+    # ---- 第 2 + 3 步：access → login_token → app_token ----
+    def login_with_access(self, access, username=""):
+        import urllib.parse as up
+        third = "huami_phone" if str(username).startswith("+86") or (
+            str(username).isdigit() and len(str(username)) == 11) else "huami"
+        d2 = ("app_name=com.xiaomi.hm.health&country_code=CN&code=%s&device_id=%s"
               "&device_model=android_phone&app_version=6.12.0&grant_type=access_token"
-              "&allow_registration=false&source=com.xiaomi.hm.health&third_name=%s" % (code, third))
-        ti = None
+              "&allow_registration=false&source=com.xiaomi.hm.health&third_name=%s"
+              % (up.quote(access), up.quote(self.device_id), third))
+        ti, cooled = None, []
         for host in CLIENT_HOSTS:
             try:
-                r2 = _http().post(host + "/v2/client/login", data=d2, headers=self.PLAIN_H, timeout=20)
-                if r2.status_code == 200:
-                    ti = (r2.json() or {}).get("token_info") or {}
-                    if ti.get("login_token"):
-                        break
+                r = _http().post(host + "/v2/client/login", data=d2,
+                                 headers=self.PLAIN_H, timeout=20)
+            except ZeppError:
+                raise
             except Exception:
                 continue
+            try:
+                payload = r.json() or {}
+            except Exception:
+                payload = {}
+            cool = _retry_after(getattr(r, "headers", {}), payload)
+            if r.status_code == 429 or cool:
+                cooled.append(cool or RATE_LIMIT_DEFAULT)
+                continue
+            if r.status_code == 200:
+                ti = payload.get("token_info") or {}
+                if ti.get("login_token"):
+                    break
         if not ti or not ti.get("login_token"):
-            raise ZeppError("换取 login_token 失败（所有主机）HTTP")
+            if cooled:
+                raise ZeppRateLimited("换取 login_token 被限流", retry_after=max(cooled))
+            raise ZeppError("换取 login_token 失败（所有主机）")
+        got = self.app_token_from_login_token(ti["login_token"]) or {}
+        if not got.get("app_token"):
+            raise ZeppError("拿 app_token 失败（所有主机）")
+        self.app_token = got["app_token"]
+        self.user_id = got.get("user_id") or ti.get("user_id")
+        self.login_token = got.get("login_token") or ti["login_token"]
+        return {"token": self.app_token, "user_id": self.user_id,
+                "login_token": self.login_token, "nickname": username,
+                "status": "ok"}
 
-        app_token = None
+    def app_token_from_login_token(self, login_token):
+        """login_token → app_token（比用密码重新登录便宜得多）。"""
         for host in TOKEN_HOSTS:
             try:
-                r3 = _http().get(
+                r = _http().get(
                     host + "/v1/client/app_tokens?app_name=com.xiaomi.hm.health"
-                    "&dn=api-user.huami.com%2Capi-mifit.huami.com%2Capp-analytics.huami.com"
-                    "&login_token=" + ti["login_token"] + "&os_version=4.1.0",
+                    "&dn=api-user.huami.com,api-mifit.huami.com,app-analytics.huami.com"
+                    "&login_token=" + login_token + "&os_version=4.1.0",
                     headers=self.PLAIN_H, timeout=20)
-                if r3.status_code == 200:
-                    app_token = ((r3.json() or {}).get("token_info") or {}).get("app_token")
-                    if app_token:
-                        break
+            except ZeppError:
+                raise
             except Exception:
                 continue
-        if not app_token:
-            raise ZeppError("拿 app_token 失败（所有主机）")
+            if r.status_code == 429:
+                raise ZeppRateLimited("换取 app_token 被限流",
+                                      retry_after=_retry_after(getattr(r, "headers", {}), {})
+                                      or RATE_LIMIT_DEFAULT)
+            if r.status_code == 200:
+                try:
+                    ti = (r.json() or {}).get("token_info") or {}
+                except Exception:
+                    ti = {}
+                if ti.get("app_token"):
+                    self.login_token = login_token
+                    self.user_id = ti.get("user_id") or getattr(self, "user_id", None)
+                    return {"app_token": ti["app_token"], "user_id": ti.get("user_id"),
+                            "login_token": login_token}
+        return None
 
-        self.app_token = app_token
-        self.user_id = ti.get("user_id")
-        self.login_token = ti["login_token"]
-        return {"token": app_token, "user_id": self.user_id, "nickname": username,
-                "status": "ok", "dry_run": self.dry_run}
+    def renew_login_token(self, login_token):
+        """login_token 续期，比整条密码登录便宜。拿不到就返回 None。"""
+        for host in RENEW_HOSTS:
+            try:
+                r = _http().get("%s/v1/client/renew_login_token?login_token=%s&timestamp=%d"
+                                "&source=com.xiaomi.hm.health"
+                                % (host, login_token, int(time.time())),
+                                headers=self.PLAIN_H, timeout=15)
+            except ZeppError:
+                raise
+            except Exception:
+                continue
+            if r.status_code == 200:
+                try:
+                    ti = (r.json() or {}).get("token_info") or {}
+                except Exception:
+                    ti = {}
+                if ti.get("login_token"):
+                    return ti["login_token"]
+        return None
+
+    # ---- token 探活：能用就别登 ----
+    def check_alive(self, token):
+        if not token:
+            return False
+        H = self._headers(token)
+        for host in ALIVE_HOSTS:
+            try:
+                r = _http().get(host + "/huami.health.getUserInfo.json", headers=H, timeout=12)
+            except ZeppError:
+                raise
+            except Exception:
+                continue
+            if r.status_code == 429:
+                raise ZeppRateLimited("探活被限流",
+                                      retry_after=_retry_after(getattr(r, "headers", {}), {})
+                                      or RATE_LIMIT_DEFAULT)
+            if r.status_code in (401, 403):
+                return False
+            if r.status_code == 200:
+                try:
+                    j = r.json() or {}
+                except Exception:
+                    return True
+                if str(j.get("message") or "").lower() == "success":
+                    return True
+                if j.get("code") in (1, "1"):
+                    return True
+                if j.get("error") or j.get("code") in (12, "12"):
+                    return False
+                return True
+        return False
+
+    def ensure_session(self, account):
+        """三级复用：app_token 探活 → login_token 换/续 → access → 密码兜底。
+
+        每次提交都重新用密码登录是最容易被 429 的路径，也是 token 互相顶掉的主因。
+        """
+        _http()
+        self.device_id = account.get("device_id") or self.device_id
+        token = (account.get("token") or "").strip()
+        uid = account.get("user_id") or ""
+        if token and self.check_alive(token):
+            return {"token": token, "user_id": uid,
+                    "login_token": account.get("login_token") or "",
+                    "device_id": self.device_id, "source": "app_token"}
+
+        lt = (account.get("login_token") or "").strip()
+        if lt:
+            got = self.app_token_from_login_token(lt)
+            if got and got.get("app_token") and self.check_alive(got["app_token"]):
+                return {"token": got["app_token"],
+                        "user_id": got.get("user_id") or uid,
+                        "login_token": got.get("login_token") or lt,
+                        "device_id": self.device_id, "source": "login_token"}
+            newer = self.renew_login_token(lt)
+            if newer:
+                got = self.app_token_from_login_token(newer)
+                if got and got.get("app_token") and self.check_alive(got["app_token"]):
+                    return {"token": got["app_token"],
+                            "user_id": got.get("user_id") or uid,
+                            "login_token": newer,
+                            "device_id": self.device_id, "source": "renew"}
+
+        username, password = account.get("username"), account.get("password")
+        if not username or not password:
+            raise ZeppError("token 失效且没有账号密码可重登")
+        res = self.login_any(username, password)
+        res.setdefault("device_id", self.device_id)
+        res["source"] = "password"
+        return res
 
     def login_any(self, username, password):
         """外部统一走这个：明文优先，失败再试加密链路（加密链路需要 pycryptodome）"""
@@ -483,6 +654,10 @@ class ZeppProvider:
             if r.status_code == 200:
                 break
             err = "HTTP %s: %s" % (r.status_code, r.text[:120])
+            if r.status_code == 429:
+                raise ZeppRateLimited("读取云端数据被限流",
+                                      retry_after=_retry_after(getattr(r, "headers", {}), {})
+                                      or RATE_LIMIT_DEFAULT)
             if r.status_code in (401, 403):
                 raise ZeppError("读取失败 %s" % err)
         if r is None or r.status_code != 200:
@@ -530,17 +705,40 @@ class ZeppProvider:
         return item
 
     def active_device_id(self, token, uid):
-        """先问服务端这个账号真正绑定的设备，写数据时用同一个 did，App 才会认"""
+        """优先查 binds.json 拿 deviceType==0 的设备（去冒号转大写），再回退老端点。"""
+        for host in ("https://api-mifit-cn.huami.com", "https://api-mifit.zepp.com"):
+            try:
+                r = _http().get("%s/v1/device/binds.json?userid=%s" % (host, uid),
+                                headers={"apptoken": token}, timeout=12)
+            except ZeppError:
+                raise
+            except Exception:
+                continue
+            if r.status_code == 429:
+                raise ZeppRateLimited("查绑定设备被限流",
+                                      retry_after=_retry_after(getattr(r, "headers", {}), {})
+                                      or RATE_LIMIT_DEFAULT)
+            if r.status_code != 200:
+                continue
+            try:
+                items = (r.json() or {}).get("items") or []
+            except Exception:
+                continue
+            for it in items:
+                if it.get("deviceType") in (0, "0"):
+                    did = str(it.get("deviceId") or it.get("mac") or "")
+                    did = did.replace(":", "").upper()
+                    if did:
+                        return did
         for host in ("https://api-mifit-cn.huami.com", "https://api-mifit.huami.com"):
             try:
                 r = _http().get("%s/users/%s/devices?enable=true" % (host, uid),
-                                 headers={"apptoken": token}, timeout=12)
+                                headers={"apptoken": token}, timeout=12)
                 if r.status_code != 200:
                     continue
                 items = (r.json() or {}).get("items") or []
                 if not items:
                     continue
-                # 优先 activeStatus 启用的，其次 bindingStatus 已绑定的
                 for it in items:
                     if not it.get("deviceId"):
                         continue
@@ -568,7 +766,8 @@ class ZeppProvider:
                 % (account.get("user_id"), int(time.time()) - 60, did, payload))
         headers = {"apptoken": account.get("token"),
                    "Content-Type": "application/x-www-form-urlencoded"}
-        return (DATA_HOST + "/v1/data/band_data.json?&t=%d" % int(time.time() * 1000)), headers, body
+        return (DATA_HOST + "/v1/data/band_data.json?&t=%d&r=%s"
+                % (int(time.time() * 1000), uuidlib.uuid4())), headers, body
 
     def submit(self, account, steps, date=None):
         steps = int(steps)
@@ -578,49 +777,58 @@ class ZeppProvider:
             raise ZeppError("步数必须大于 0")
         """
         报文必须带设备原始数据（data / data_hr），只发 summary 服务端会静默丢弃。
-        模板取自 Caryio/ChangeWechatSport 的实测报文，只替换日期和步数。
-        发送后一律回读校验，不拿 200 当成功。
+        模板取自公开实测报文，只替换日期和步数；发送后一律回读校验，不拿 200 当成功。
         """
-        token, uid = account.get("token"), account.get("user_id")
+        self.device_id = account.get("device_id") or self.device_id
         if not self.dry_run:
             _http()
         if self.dry_run:
             return {"ok": True, "submitted": 0, "dry_run": True,
                     "message": "演练模式：包已组装，未发送"}
 
-        # token 会被新登录顶掉，遇到 401 自动重登一次
-        def relogin():
-            u, pw = account.get("username"), account.get("password")
-            if not u or not pw:
-                raise ZeppError("token 失效且没有账号密码可重登")
-            try:
-                res = self.login_plain(u, pw)
-            except Exception as e1:
-                if "429" in str(e1):      # 限流就别再撞加密链路了，会把错误搞混
-                    raise e1
-                res = self.login(u, pw)
-            account["token"] = res["token"]
-            account["user_id"] = res["user_id"]
-            return res["token"], res["user_id"]
+        sess = self.ensure_session(account)
+        token, uid = sess["token"], sess.get("user_id") or account.get("user_id")
+        login_token = sess.get("login_token") or account.get("login_token") or ""
 
+        def apply(sess):
+            account["token"] = sess["token"]
+            account["user_id"] = sess.get("user_id") or account.get("user_id")
+            account["login_token"] = sess.get("login_token") or account.get("login_token")
+            account["device_id"] = self.device_id
+
+        apply(sess)
         try:
             before = self.read_day(token, uid, date)
         except ZeppError as e:
             if "401" not in str(e):
                 raise
-            token, uid = relogin()
+            # token 被顶掉：只换 token，不再整条密码登录
+            sess = self.ensure_session({**account, "token": ""})
+            apply(sess)
+            token, uid, login_token = sess["token"], sess.get("user_id") or uid, sess.get("login_token") or ""
             before = self.read_day(token, uid, date)
 
         did = self.active_device_id(token, uid)
         url, headers, form = self.build_upload(account, steps, date, self._template(), did)
         r, last = None, None
         for host in DATA_HOSTS:
-            u = "%s/v1/data/band_data.json?&t=%d" % (host, int(time.time() * 1000))
+            u = "%s/v1/data/band_data.json?&t=%d&r=%s" % (
+                host, int(time.time() * 1000), uuidlib.uuid4())
             try:
                 r = _http().post(u, data=form, headers=headers, timeout=25)
+            except ZeppError:
+                raise
             except Exception as e:
                 last = "%s 连不上（%s）" % (host, type(e).__name__)
                 continue
+            try:
+                payload = r.json() or {}
+            except Exception:
+                payload = {}
+            cool = _retry_after(getattr(r, "headers", {}), payload)
+            if r.status_code == 429 or cool:
+                raise ZeppRateLimited("上传被限流（%s）" % host,
+                                      retry_after=cool or RATE_LIMIT_DEFAULT)
             if r.status_code == 200:
                 break
             last = "HTTP %s: %s" % (r.status_code, r.text[:120])
@@ -640,4 +848,6 @@ class ZeppProvider:
         else:
             msg = "提交成功但云端仍是 %d 步" % now_steps
         return {"ok": True, "submitted": now_steps, "changed": changed,
-                "before": (before or {}).get("steps"), "message": msg}
+                "before": (before or {}).get("steps"), "message": msg,
+                "session": {"token": token, "user_id": uid, "login_token": login_token,
+                            "device_id": self.device_id, "source": sess.get("source")}}

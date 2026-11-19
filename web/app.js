@@ -99,6 +99,7 @@ function card(a) {
           <span class="chip ${a.provider.startsWith('zepp') ? 'acc' : ''}">${provLabel(a.provider)}</span>
           ${a.custody ? '<span class="chip ok">托管中</span>' : ''}
           ${a.share ? '<span class="chip acc">公开可申请</span>' : ''}
+          ${a.cooldown_left > 0 ? `<span class="chip ok">冷却 ${Math.ceil(a.cooldown_left / 60)} 分</span>` : ''}
         </div>
       </div>
       <div class="toggle ${a.custody ? 'on' : ''}" data-act="custody"></div>

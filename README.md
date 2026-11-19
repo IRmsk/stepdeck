@@ -75,7 +75,11 @@ http://127.0.0.1:8088/admin     管理端（也认 /admin/ 和 /admin.html）
 
 ## 四、登录链路
 
-三段式，每段都在多台主机之间轮换，命中 429 或超时就换下一台：
+**日常不登录**：提交前先按「app_token 探活 → login_token 换新 app_token → login_token 续期 →
+密码登录」的顺序复用 token，探活通过就直接用。每次提交都重新登录是最容易被限流、
+也是多进程互相顶掉 token 的主因（同一个账号的 app_token 派生自 login_token，重新登录会让旧的失效）。
+
+三段式登录本身在四台主机之间轮换，命中 429 或超时就换下一台：
 
 ```
 POST {api-user}/registrations/{account}/tokens
@@ -91,8 +95,14 @@ GET  {account-cn}/v1/client/app_tokens?login_token=..
 → token_info.app_token
 ```
 
-手机号会自动补 `+86` 前缀，邮箱原样提交。密码用一个独立的 AES-128-CBC 链路做备份，
-两条链路的限流互相独立，一条被限时另一条还能用。
+手机号会自动补 `+86` 前缀，邮箱原样提交。密码用一个独立的 AES-128-CBC 链路做备份。
+
+每个账号会持久化一个设备号（`uuid4`，登录和上报共用），不再每次随机生成，也不再写死
+`00:00:00:00:00:00`——两条链路设备身份不一致容易被判成异地登录，也会让 token 互相顶掉。
+
+**限流是状态机，不是一次重试**：除了 HTTP 429，还有 HTTP 200 + `{"code":12,"message":"too many requests"}`。
+两种都会被识别，冷却时间优先取 `Retry-After`（没有就 429 按 2 小时、业务限流按 2 小时）。
+冷却写进数据库（`accounts.cooldown_until`），**冷却期内连登录请求都不发**——账号维度被限流时换主机无效。
 
 ## 五、上报链路
 
@@ -137,7 +147,8 @@ POST {data}/v1/data/band_data.json?&t=<毫秒>
 **单日上限 98800**：超过会被截断，服务端在提交前就拦下并返回明确错误。
 
 **限流**：登录接口对同一 IP 与同一账号都有频率限制，连续几次就返回 429。
-多主机轮换能缓解，但账号被单独限流时只能等，通常一小时起步。
+社区实测同一 IP 约 10 个账号是阈值；多主机轮换只能缓解 IP 维度，账号维度被限流时只能等。
+StepDeck 现在会把冷却时间落库，冷却期内不重试，卡片上显示「冷却 N 分」。
 
 **时区**：调度、日志、`last_run` 一律按 UTC+8 判断。以前用容器本地时间，
 服务器是 UTC 时执行时间和「今天」都会整体错 8 小时。
@@ -246,3 +257,18 @@ python3 -m unittest discover -s tests -v
 ## 十二、更新记录
 
 见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 十三、协议来源与同类项目
+
+报文和登录链路不是凭空的，主要核对过这些实现（2026-11 调研）：
+
+| 项目 | 借鉴了什么 |
+|---|---|
+| [TonyJiangWJ/mimotion](https://github.com/TonyJiangWJ/mimotion) | 三级 token 复用 + 探活 + `renew_login_token`；每账号持久化 `device_id`；`binds.json` 取绑定设备 |
+| [argrento/huami-token](https://github.com/argrento/huami-token) | 异常分层（认证/设备/限流）、登录响应解析要容错 |
+| [xueji-x/Zepp-Steps-Automation](https://github.com/xueji-x/Zepp-Steps-Automation) | 429 当全局状态机：`Retry-After` 优先、持久化冷却、冷却期内不登录 |
+| [FTech6/Zepp_Sport_Robot](https://github.com/FTech6/Zepp_Sport_Robot) | `code:12` 业务限流的证据、最简报文 |
+| [Caryio/ChangeWechatSport](https://github.com/Caryio/ChangeWechatSport) | 原始报文模板（项目已 archived，不再当基线） |
+
+注意许可：mimotion / huami-token 是 Apache-2.0 / MIT，可以对照实现；FTech6 是 AGPL-3.0，
+不要直接复制它的代码。本项目只参考协议行为，代码是重新写的。
