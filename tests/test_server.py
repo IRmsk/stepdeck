@@ -386,6 +386,65 @@ class TestRateLimitCooldown(Base):
         self.assertEqual(dev, dev2, "改账号不该换 device_id")
 
 
+class FakeDevProvider:
+    name = "fake_dev"
+    device_id = "dev"
+
+    def login(self, username, password):
+        return {"token": "tok", "user_id": "7", "status": "ok"}
+
+    def list_devices(self, token, uid):
+        return [{"deviceId": "F4ED7CEC969447E3", "deviceType": 0, "bindingStatus": 1,
+                 "lastDataSyncTime": time.time() - 600}]
+
+
+class TestDeviceCheck(Base):
+    def setUp(self):
+        server.PROVIDERS["fake_dev"] = lambda: FakeDevProvider()
+        c = server.db()
+        c.execute("INSERT OR REPLACE INTO accounts(id, username, provider, token, user_id, "
+                  "status, created_at) VALUES('de0001','d@example.com','fake_dev','tok','7','ok',?)",
+                  (server.now_str(),))
+        c.commit()
+        c.close()
+
+    def tearDown(self):
+        server.PROVIDERS.pop("fake_dev", None)
+        c = server.db()
+        c.execute("DELETE FROM accounts WHERE id='de0001'")
+        c.commit()
+        c.close()
+
+    def test_verdict_levels(self):
+        from provider_zepp import device_verdict
+        self.assertEqual(device_verdict([])[0], "bad")
+        self.assertEqual(device_verdict([{"lastDataSyncTime": time.time() - 600}])[0], "ok")
+        self.assertEqual(device_verdict([{"lastDataSyncTime": time.time() - 86400 * 30}])[0], "warn")
+        self.assertEqual(device_verdict([{}])[0], "warn")
+
+    def test_endpoint_returns_devices(self):
+        cookie = self.login()
+        st, data, _ = self.call("GET", "/api/accounts/de0001/check", cookie=cookie)
+        self.assertEqual(st, 200)
+        self.assertTrue(data["ok"], data)
+        self.assertEqual(data["level"], "ok")
+        self.assertEqual(len(data["devices"]), 1)
+        self.assertEqual(data["devices"][0]["deviceId"], "F4ED7CEC969447E3")
+
+    def test_endpoint_requires_login(self):
+        st, data, _ = self.call("GET", "/api/accounts/de0001/check")
+        self.assertEqual(st, 401)
+
+    def test_endpoint_without_token(self):
+        cookie = self.login()
+        c = server.db()
+        c.execute("UPDATE accounts SET token='' WHERE id='de0001'")
+        c.commit(); c.close()
+        st, data, _ = self.call("GET", "/api/accounts/de0001/check", cookie=cookie)
+        self.assertFalse(data["ok"])
+        self.assertIn("token", data["message"])
+
+
 class TestSchedulerHelpers(Base):
     def test_last_run_parsing(self):
         dt = server._last_run_dt("2026-11-19 07:30:00")

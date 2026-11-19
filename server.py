@@ -765,6 +765,49 @@ def _set_cooldown(acc_id, seconds, reason=""):
     return until
 
 
+def api_device_check(acc_id):
+    """只读：用现有 token 查这个账号绑了哪些设备，判断微信/支付宝链路通不通。
+
+    刻意不在这里登录：多一次密码登录就多一次 429 的机会。
+    """
+    c = db()
+    r = c.execute("SELECT * FROM accounts WHERE id=?", (acc_id,)).fetchone()
+    c.close()
+    if not r:
+        return {"ok": False, "message": "账号不存在"}
+    acc = dict(r)
+    if not acc.get("token"):
+        return {"ok": False,
+                "message": "这个账号还没有可用 token，先点一次「提交」或「修改」完成登录再查"}
+    try:
+        prov = get_provider(acc["provider"])
+    except ProviderError as e:
+        return {"ok": False, "message": str(e)}
+    if not hasattr(prov, "list_devices"):
+        return {"ok": False, "message": "这个通道不支持查绑定设备"}
+    try:
+        items = prov.list_devices(acc["token"], acc.get("user_id"))
+    except Exception as e:
+        if ZeppRateLimited and isinstance(e, ZeppRateLimited):
+            return {"ok": False, "rate_limited": True,
+                    "message": "查设备被限流：%s" % e}
+        return {"ok": False, "message": str(e)}
+    from provider_zepp import device_verdict
+    level, verdict = device_verdict(items)
+    keep = ("deviceId", "deviceType", "deviceSource", "productId", "deviceName",
+            "bindingStatus", "activeStatus", "lastDataSyncTime")
+    devs = []
+    for it in items:
+        d = {k: it.get(k) for k in keep if it.get(k) not in (None, "")}
+        try:
+            d["lastSync"] = datetime.fromtimestamp(int(it.get("lastDataSyncTime"))
+                                                  ).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+        devs.append(d)
+    return {"ok": True, "devices": devs, "level": level, "verdict": verdict}
+
+
 def do_submit(acc_id, steps=None):
     c = db()
     r = c.execute("SELECT * FROM accounts WHERE id=?", (acc_id,)).fetchone()
@@ -1158,6 +1201,9 @@ class Handler(BaseHTTPRequestHandler):
             if p.startswith("/api/"):
                 if not self._admin():
                     return self._deny()
+            m = re.fullmatch(r"/api/accounts/([0-9a-f]+)/check", p)
+            if m:
+                return self._json(api_device_check(m.group(1)))
             if p == "/api/accounts":
                 return self._json({"ok": True, "accounts": api_accounts()})
             if p == "/api/requests":
@@ -1269,6 +1315,10 @@ class Handler(BaseHTTPRequestHandler):
             m = re.fullmatch(r"/api/accounts/([0-9a-f]+)/update", p)
             if m:
                 return self._json(api_update_account(m.group(1), body))
+
+            m = re.fullmatch(r"/api/accounts/([0-9a-f]+)/check", p)
+            if m:
+                return self._json(api_device_check(m.group(1)))
 
             m = re.fullmatch(r"/api/accounts/([0-9a-f]+)/submit", p)
             if m:
