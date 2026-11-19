@@ -46,6 +46,8 @@
   </div>
 </section>
 
+<div class="warnbar" id="provWarn" hidden></div>
+
 <section class="section">
   <div class="section-head">
     <h2>待审申请 <span class="count" id="reqCount">0</span></h2>
@@ -83,9 +85,7 @@
     <label>备注<input id="fNote" autocomplete="off" placeholder="例如：主号 / 小号（公开页会显示这个）" maxlength="20"></label>
     <label>通道
       <select id="fProv">
-        <option value="zepp_dry">Zepp · 演练（组包不发送）</option>
-        <option value="zepp">Zepp · 真实提交</option>
-        <option value="mock">模拟（离线）</option>
+        <option value="zepp_dry">加载中…</option>
       </select>
     </label>
     <p class="hint" id="probeMsg">可以先检测账号是否存在，不用密码</p>
@@ -127,9 +127,7 @@
     <label>备注<input id="eNote" autocomplete="off" placeholder="例如：小号 / 公司号"></label>
     <label>通道
       <select id="eProv">
-        <option value="zepp_dry">Zepp · 演练</option>
-        <option value="zepp">Zepp · 真实提交</option>
-        <option value="mock">模拟（离线）</option>
+        <option value="zepp_dry">加载中…</option>
       </select>
     </label>
     <p class="hint">改账号或密码会重新登录换 token</p>

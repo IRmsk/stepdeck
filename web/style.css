@@ -208,3 +208,7 @@ body{padding:0 0 40px}
 
 .chip.note { color: #9fb6ff; border-color: rgba(120,150,255,.4); }
 .chip.ghost { color: var(--dim, #7b8496); border-style: dashed; }
+
+.warnbar{margin:10px 18px 0;padding:10px 12px;border-radius:10px;
+  border:1px solid #4a3a1e;background:rgba(255,182,72,.10);color:var(--warn);
+  font-size:12px;line-height:1.55}

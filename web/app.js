@@ -27,7 +27,46 @@ function hideGate() {
 }
 
 const S = {
-  stepsInput: {}, accounts: [], requests: [], editId: null, cfgId: null };
+  stepsInput: {}, accounts: [], requests: [], editId: null, cfgId: null,
+  meta: null, limits: { maxSteps: 98800 } };
+
+// 通道清单：优先用服务端 /api/meta 的真实可用性，拿不到再用这份兜底
+const FALLBACK_PROVIDERS = [
+  { id: 'zepp_dry', label: 'Zepp · 演练（组包不发送）', real: false, available: true },
+  { id: 'zepp', label: 'Zepp · 真实提交', real: true, available: true },
+  { id: 'mock', label: '离线模拟（不碰网络）', real: false, available: true },
+];
+
+function fillProviderSelects(list) {
+  const provs = (list && list.length) ? list : FALLBACK_PROVIDERS;
+  [['#fProv', 'zepp_dry'], ['#eProv', 'zepp_dry']].forEach(([sel, def]) => {
+    const el = $(sel);
+    if (!el) return;
+    const cur = el.value || def;
+    el.innerHTML = provs.map(p => `<option value="${esc(p.id)}"${p.available ? '' : ' disabled'}>`
+      + `${esc(p.label)}${p.available ? '' : '（不可用）'}</option>`).join('');
+    const hit = provs.find(p => p.id === cur && p.available);
+    el.value = hit ? cur : (provs.find(p => p.available) || provs[0]).id;
+  });
+}
+
+async function loadMeta() {
+  const r = await api('/api/meta');
+  if (!r || !r.ok) return;
+  S.meta = r;
+  S.limits = r.limits || S.limits;
+  fillProviderSelects(r.providers);
+  const warn = $('#provWarn');
+  if (warn) {
+    if (r.provider_import_error) {
+      warn.hidden = false;
+      warn.textContent = 'Zepp 通道不可用：' + r.provider_import_error
+        + ' —— 现在只能演练/模拟，装好依赖后重启服务。';
+    } else {
+      warn.hidden = true;
+    }
+  }
+}
 const n = v => (v || 0).toLocaleString('en-US');
 
 function toast(msg, ms = 1900) {
@@ -59,6 +98,8 @@ function card(a) {
           <span>${esc(a.username)}</span>
           <span class="chip ${a.provider.startsWith('zepp') ? 'acc' : ''}">${provLabel(a.provider)}</span>
           ${a.custody ? '<span class="chip ok">托管中</span>' : ''}
+          ${a.share ? '<span class="chip acc">公开可申请</span>' : ''}
+          ${a.cooldown_left > 0 ? `<span class="chip ok">冷却 ${Math.ceil(a.cooldown_left / 60)} 分</span>` : ''}
         </div>
       </div>
       <div class="toggle ${a.custody ? 'on' : ''}" data-act="custody"></div>
@@ -91,6 +132,7 @@ function card(a) {
       <button class="btn sm ghost" data-act="submit">按目标提交</button>
       <button class="btn sm ghost" data-act="config">设置</button>
       <button class="btn sm ghost" data-act="note">备注</button>
+      <button class="btn sm ghost" data-act="share">${a.share ? '取消公开' : '公开'}</button>
       <button class="btn sm ghost" data-act="edit">修改</button>
       <button class="btn sm danger" data-act="delete">删除</button>
     </div>
@@ -254,6 +296,14 @@ document.addEventListener('click', async e => {
       refresh(); break;
     }
 
+    case 'share': {
+      const r = await api(`/api/accounts/${a.id}/update`, {
+        method: 'POST', body: { share: !a.share },
+      });
+      toast(r.ok ? (!a.share ? '已开放到公开页' : '已从公开页撤下') : (r.message || '操作失败'), 2400);
+      refresh(); break;
+    }
+
     case 'config':
       S.cfgId = a.id;
       $('#cTarget').value = a.target || '';
@@ -350,7 +400,7 @@ async function tryLogin() {
   gateBtn.disabled = true;
   const r = await api('/api/admin/login', { method: 'POST', body: { password: pw } });
   gateBtn.disabled = false;
-  if (!r.ok) return toast(r.message || '登录失败', 3000);
+  if (!r.ok) return toast(r.message || '登录失败', 3200);
   gatePass.value = '';
   hideGate();
   boot();
@@ -382,11 +432,13 @@ if (ra) ra.onclick = () => loadRequests();
 async function boot() {
   const me = await fetch('/api/admin/me').then(r => r.json()).catch(() => ({}));
   if (!me.admin) {
-    if (me.ready === false) showGate('第一次使用：设置一个管理员密码');
-    else showGate('输入管理员密码进入');
+    showGate(me.ready === false
+      ? '服务端还没初始化密码，看 data/' + (me.initHint || 'INITIAL-PASSWORD.txt')
+      : '输入管理员密码进入');
     return;
   }
   hideGate();
+  await loadMeta();
   refresh(); refreshLogs(); loadRequests();
   setInterval(refresh, 5000);
   setInterval(loadRequests, 6000);
